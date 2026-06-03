@@ -1,0 +1,13 @@
+{
+  "enabled": false,
+  "threshold": 90,
+  "kitty_pause_on_switch": false,
+  "resume_before_reset_hours": 0.5,
+  "accounts": [
+    {"label": "work", "email_pattern": "yourcompany.com"},
+    {"label": "personal", "email_pattern": "gmail.com"}
+  ],
+  "active_account": "",
+  "last_switch_time": 0,
+  "other_account_resets_at": ""
+}

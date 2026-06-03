@@ -1,0 +1,20 @@
+# .gitignore — never commit credentials or runtime state
+
+# Credentials (contain OAuth tokens!)
+.claude-keychain-*.json
+.claude.json.*
+*.keychain
+
+# Runtime state
+auto-switch.log
+auto-switch-last-log.txt
+auto-switch-last-poll.json
+auto-switch-resume.pid
+auto-switch-resume-time.txt
+stats-cache.json
+
+# Generated config (contains account state)
+auto-switch-config.json
+
+# macOS
+.DS_Store
