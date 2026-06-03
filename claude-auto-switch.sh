@@ -14,16 +14,25 @@
 #
 # Runs every 60s via launchd. See README.md for setup instructions.
 
-# Ensure Homebrew python3 is available
-export PATH="/opt/homebrew/bin:$PATH"
+# Ensure Homebrew python3 is available (macOS with Homebrew)
+[ -d /opt/homebrew/bin ] && export PATH="/opt/homebrew/bin:$PATH"
+
+OS_TYPE="$(uname -s)"  # Darwin or Linux
 
 CONFIG="$HOME/.claude/auto-switch-config.json"
 CACHE="$HOME/.claude/stats-cache.json"
 LOG="$HOME/.claude/auto-switch.log"
 RESUME_PID_FILE="$HOME/.claude/auto-switch-resume.pid"
-KITTY_BIN="/Applications/kitty.app/Contents/MacOS/kitty"
+# Kitty binary: macOS app bundle or Linux PATH
+if [ "$OS_TYPE" = "Darwin" ]; then
+  KITTY_BIN="/Applications/kitty.app/Contents/MacOS/kitty"
+else
+  KITTY_BIN="$(command -v kitty 2>/dev/null || echo kitty)"
+fi
 
 CLAUDE_JSON="$HOME/.claude.json"
+# Linux: Claude Code stores the token in ~/.claude/.credentials.json instead of macOS Keychain
+LINUX_CREDENTIALS="$HOME/.claude/.credentials.json"
 KEYCHAIN_SERVICE="Claude Code-credentials"
 KEYCHAIN_ACCOUNT="$(whoami)"
 SETTINGS="$HOME/.claude/settings.json"
@@ -142,7 +151,12 @@ credentials_ready() {
 save_current_credentials() {
   local LABEL="$1"
   cp "$CLAUDE_JSON" "$(claude_json_backup "$LABEL")"
-  security find-generic-password -l "$KEYCHAIN_SERVICE" -w 2>/dev/null > "$(keychain_backup "$LABEL")"
+  if [ "$OS_TYPE" = "Darwin" ]; then
+    security find-generic-password -l "$KEYCHAIN_SERVICE" -w 2>/dev/null > "$(keychain_backup "$LABEL")"
+  else
+    # Linux: credentials live in ~/.claude/.credentials.json
+    [ -f "$LINUX_CREDENTIALS" ] && cp "$LINUX_CREDENTIALS" "$(keychain_backup "$LABEL")"
+  fi
 }
 
 restore_credentials() {
@@ -158,12 +172,17 @@ restore_credentials() {
 
   # Restore target
   cp "$JSON_FILE" "$CLAUDE_JSON"
-  local KEYCHAIN_DATA
-  KEYCHAIN_DATA=$(cat "$KEYCHAIN_FILE")
-  security delete-generic-password -l "$KEYCHAIN_SERVICE" 2>/dev/null
-  security add-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" \
-    -l "$KEYCHAIN_SERVICE" -w "$KEYCHAIN_DATA" 2>/dev/null
-  cp "$SETTINGS_PERSONAL" "$SETTINGS"
+  if [ "$OS_TYPE" = "Darwin" ]; then
+    local KEYCHAIN_DATA
+    KEYCHAIN_DATA=$(cat "$KEYCHAIN_FILE")
+    security delete-generic-password -l "$KEYCHAIN_SERVICE" 2>/dev/null
+    security add-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" \
+      -l "$KEYCHAIN_SERVICE" -w "$KEYCHAIN_DATA" 2>/dev/null
+  else
+    # Linux: write directly to credentials file
+    cp "$KEYCHAIN_FILE" "$LINUX_CREDENTIALS"
+  fi
+  [ -f "$SETTINGS_PERSONAL" ] && cp "$SETTINGS_PERSONAL" "$SETTINGS"
 }
 
 # ── Kitty terminal helpers ──
