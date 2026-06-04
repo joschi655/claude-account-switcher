@@ -22,6 +22,7 @@ OS_TYPE="$(uname -s)"  # Darwin or Linux
 CONFIG="$HOME/.claude/auto-switch-config.json"
 CACHE="$HOME/.claude/stats-cache.json"
 LOG="$HOME/.claude/auto-switch.log"
+SESSION_STATE="$HOME/.claude/session-autostart-state.json"
 RESUME_PID_FILE="$HOME/.claude/auto-switch-resume.pid"
 # Kitty binary: macOS app bundle or Linux PATH
 if [ "$OS_TYPE" = "Darwin" ]; then
@@ -29,6 +30,7 @@ if [ "$OS_TYPE" = "Darwin" ]; then
 else
   KITTY_BIN="$(command -v kitty 2>/dev/null || echo kitty)"
 fi
+CLAUDE_BIN="$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")"
 
 CLAUDE_JSON="$HOME/.claude.json"
 # Linux: Claude Code stores the token in ~/.claude/.credentials.json instead of macOS Keychain
@@ -73,9 +75,17 @@ read_config() {
   "threshold": 90,
   "kitty_pause_on_switch": false,
   "resume_before_reset_hours": 0.5,
+  "session_autostart_enabled": false,
+  "session_autostart_threshold": 70,
+  "session_autostart_hour": 6,
+  "session_autostart_prompt": "test",
+  "session_autostart_model": "haiku",
+  "session_autostart_allowed_tools": "Read",
+  "session_autostart_max_turns": 1,
+  "session_autostart_output_format": "json",
   "accounts": [
-    {"label": "account1", "email_pattern": "example1.com"},
-    {"label": "account2", "email_pattern": "example2.com"}
+    {"label": "account1@example.com"},
+    {"label": "account2@example.com"}
   ],
   "active_account": "",
   "last_switch_time": 0,
@@ -88,6 +98,14 @@ EOF
   THRESHOLD=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('threshold', 90))" 2>/dev/null)
   KITTY_PAUSE=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('kitty_pause_on_switch', False))" 2>/dev/null)
   RESUME_HOURS=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('resume_before_reset_hours', 0.5))" 2>/dev/null)
+  SESSION_AUTOSTART_ENABLED=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('session_autostart_enabled', False))" 2>/dev/null)
+  SESSION_AUTOSTART_THRESHOLD=$(python3 -c "import json; print(int(json.load(open('$CONFIG')).get('session_autostart_threshold', 70)))" 2>/dev/null)
+  SESSION_AUTOSTART_HOUR=$(python3 -c "import json; print(int(json.load(open('$CONFIG')).get('session_autostart_hour', 6)))" 2>/dev/null)
+  SESSION_AUTOSTART_PROMPT=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('session_autostart_prompt', 'test'))" 2>/dev/null)
+  SESSION_AUTOSTART_MODEL=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('session_autostart_model', 'haiku'))" 2>/dev/null)
+  SESSION_AUTOSTART_ALLOWED_TOOLS=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('session_autostart_allowed_tools', 'Read'))" 2>/dev/null)
+  SESSION_AUTOSTART_MAX_TURNS=$(python3 -c "import json; print(int(json.load(open('$CONFIG')).get('session_autostart_max_turns', 1)))" 2>/dev/null)
+  SESSION_AUTOSTART_OUTPUT_FORMAT=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('session_autostart_output_format', 'json'))" 2>/dev/null)
   LAST_SWITCH_TIME=$(python3 -c "import json; print(int(json.load(open('$CONFIG')).get('last_switch_time', 0)))" 2>/dev/null)
 }
 
@@ -109,20 +127,10 @@ print(d.get('oauthAccount', {}).get('emailAddress', 'unknown'))
 " 2>/dev/null || echo "unknown"
 }
 
-# Match email to label via email_pattern entries in config
+# Email IS the label — no pattern matching needed
 account_label() {
   local EMAIL="$1"
-  python3 -c "
-import json
-d = json.load(open('$CONFIG'))
-email = '$EMAIL'.lower()
-for acc in d.get('accounts', []):
-    pattern = acc.get('email_pattern', '').lower()
-    if pattern and pattern in email:
-        print(acc['label'])
-        exit()
-print('unknown')
-" 2>/dev/null || echo "unknown"
+  echo "$EMAIL"
 }
 
 # Return next account label in rotation (wraps around — supports N accounts)
@@ -142,6 +150,144 @@ else:
 
 claude_json_backup() { echo "$HOME/.claude.json.$1"; }
 keychain_backup()    { echo "$HOME/.claude-keychain-$1.json"; }
+
+# Refresh token for a backup credential file using OAuth2 refresh_token grant
+refresh_backup_token() {
+  local LABEL="$1"
+  local KEYCHAIN_FILE
+  KEYCHAIN_FILE=$(keychain_backup "$LABEL")
+  [ ! -f "$KEYCHAIN_FILE" ] && return 1
+
+  python3 -c "
+import json, urllib.request, os, time
+
+KEYCHAIN_FILE = '$KEYCHAIN_FILE'
+CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+TOKEN_URL = 'https://api.anthropic.com/v1/oauth/token'
+
+cred = json.loads(open(KEYCHAIN_FILE).read())
+oauth = cred.get('claudeAiOauth', {})
+refresh_token = oauth.get('refreshToken', '')
+expires_at = oauth.get('expiresAt', 0)
+
+if not refresh_token:
+    exit(1)
+
+# Only refresh if less than 2 hours left
+now_ms = int(time.time() * 1000)
+hours_left = (expires_at - now_ms) / 3600000
+if hours_left > 2:
+    exit(0)  # still fresh enough
+
+data = json.dumps({
+    'grant_type': 'refresh_token',
+    'refresh_token': refresh_token,
+    'client_id': CLIENT_ID
+}).encode()
+req = urllib.request.Request(TOKEN_URL, data=data, headers={
+    'Content-Type': 'application/json',
+    'anthropic-beta': 'oauth-2025-04-20'
+}, method='POST')
+
+try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        result = json.loads(resp.read())
+    cred['claudeAiOauth']['accessToken'] = result['access_token']
+    cred['claudeAiOauth']['refreshToken'] = result['refresh_token']
+    cred['claudeAiOauth']['expiresAt'] = now_ms + result['expires_in'] * 1000
+    open(KEYCHAIN_FILE, 'w').write(json.dumps(cred))
+    print(f'REFRESHED {hours_left:.1f}h -> {result[\"expires_in\"]/3600:.1f}h')
+except Exception as e:
+    print(f'REFRESH_FAILED: {e}')
+    exit(1)
+" 2>/dev/null
+}
+
+# Refresh all backup tokens that are expiring soon
+refresh_all_tokens() {
+  for f in "$HOME"/.claude-keychain-*.json; do
+    [ ! -f "$f" ] && continue
+    local LABEL
+    LABEL=$(echo "$f" | sed "s|.*\.claude-keychain-\(.*\)\.json|\1|")
+    local RESULT
+    RESULT=$(refresh_backup_token "$LABEL" 2>&1)
+    [ -n "$RESULT" ] && log "TOKEN: $LABEL: $RESULT"
+  done
+}
+
+claude_process_running() {
+  pgrep -f '(^|/)claude($| )' >/dev/null 2>&1
+}
+
+mark_session_autostart() {
+  local LABEL="$1"
+  local DAY_KEY="$2"
+  local WINDOW_KEY="$3"
+  python3 -c "
+import json, os
+path = '$SESSION_STATE'
+state = {}
+if os.path.exists(path):
+    state = json.load(open(path))
+state['last_account'] = '$LABEL'
+state['last_day_key'] = '$DAY_KEY'
+state['last_window_key'] = '$WINDOW_KEY'
+json.dump(state, open(path, 'w'), indent=2)
+" 2>/dev/null
+}
+
+maybe_autostart_session() {
+  local LABEL="$1"
+  local UTIL="$2"
+  local RESETS_AT="$3"
+
+  [ "$SESSION_AUTOSTART_ENABLED" != "True" ] && return 0
+  [ ! -x "$CLAUDE_BIN" ] && log "SESSION: skipped — claude CLI not found at $CLAUDE_BIN" && return 0
+  claude_process_running && return 0
+
+  local TODAY DAY_KEY WINDOW_KEY CURRENT_HOUR LAST_DAY_KEY LAST_WINDOW_KEY SHOULD_START REASON
+  TODAY=$(date +%F)
+  DAY_KEY="$LABEL|$TODAY"
+  WINDOW_KEY="$LABEL|$RESETS_AT"
+  CURRENT_HOUR=$(date +%H)
+  SHOULD_START="no"
+  REASON=""
+
+  read -r LAST_DAY_KEY LAST_WINDOW_KEY <<< $(python3 -c "
+import json, os
+path = '$SESSION_STATE'
+if os.path.exists(path):
+    state = json.load(open(path))
+    print(state.get('last_day_key', ''), state.get('last_window_key', ''))
+else:
+    print('', '')
+" 2>/dev/null)
+
+  if [ "$CURRENT_HOUR" -ge "$SESSION_AUTOSTART_HOUR" ] && [ "$LAST_DAY_KEY" != "$DAY_KEY" ]; then
+    SHOULD_START="yes"
+    REASON="daily"
+  fi
+
+  if [ "$UTIL" -ge "$SESSION_AUTOSTART_THRESHOLD" ] && [ "$RESETS_AT" != "none" ] && [ "$LAST_WINDOW_KEY" != "$WINDOW_KEY" ]; then
+    SHOULD_START="yes"
+    REASON=${REASON:+$REASON+threshold}
+    REASON=${REASON:-threshold}
+  fi
+
+  [ "$SHOULD_START" != "yes" ] && return 0
+
+  local RUN_LOG
+  RUN_LOG="$HOME/.claude/session-autostart-$(date +%s).log"
+  nohup "$CLAUDE_BIN" -p "$SESSION_AUTOSTART_PROMPT" \
+    --model "$SESSION_AUTOSTART_MODEL" \
+    --allowedTools "$SESSION_AUTOSTART_ALLOWED_TOOLS" \
+    --max-turns "$SESSION_AUTOSTART_MAX_TURNS" \
+    --output-format "$SESSION_AUTOSTART_OUTPUT_FORMAT" \
+    > "$RUN_LOG" 2>&1 &
+
+  mark_session_autostart "$LABEL" "$DAY_KEY" "$WINDOW_KEY"
+  log "SESSION: started cheap claude run for $LABEL ($REASON, util=${UTIL}%, log=$RUN_LOG)"
+}
 
 credentials_ready() {
   local LABEL="$1"
@@ -290,7 +436,10 @@ except:
 # ── Main ──
 read_config
 
-[ "$ENABLED" != "True" ] && exit 0
+# Keep backup tokens fresh on every timer run, independent of auto-switch state.
+refresh_all_tokens
+
+[ "$ENABLED" != "True" ] && [ "$SESSION_AUTOSTART_ENABLED" != "True" ] && exit 0
 [ "$(should_poll)" != "yes" ] && exit 0
 
 # Get current account
@@ -312,7 +461,7 @@ u = d.get('usage', {}).get('five_hour', {})
 print(int(u.get('utilization', 0)), u.get('resets_at', '') or 'none')
 " 2>/dev/null || echo "0 none")
 else
-  # Success — update cache + poll timer + refresh active account backup (keeps token fresh)
+  # Success — update cache + poll timer + refresh active account backup.
   python3 -c "
 import json, time
 now = int(time.time())
@@ -323,7 +472,11 @@ json.dump({'util': $UTIL, 'time': now}, open('$LAST_POLL_FILE', 'w'))
   save_current_credentials "$CUR_LABEL"
 fi
 
+maybe_autostart_session "$CUR_LABEL" "$UTIL" "$RESETS_AT"
+
 log "POLL: $CUR_LABEL=${UTIL}%"
+
+[ "$ENABLED" != "True" ] && exit 0
 
 # Cooldown: no switch within 5 minutes of the last switch
 NOW=$(date +%s)

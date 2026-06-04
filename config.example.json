@@ -3,9 +3,17 @@
   "threshold": 90,
   "kitty_pause_on_switch": false,
   "resume_before_reset_hours": 0.5,
+  "session_autostart_enabled": false,
+  "session_autostart_threshold": 70,
+  "session_autostart_hour": 6,
+  "session_autostart_prompt": "test",
+  "session_autostart_model": "haiku",
+  "session_autostart_allowed_tools": "Read",
+  "session_autostart_max_turns": 1,
+  "session_autostart_output_format": "json",
   "accounts": [
-    {"label": "work", "email_pattern": "yourcompany.com"},
-    {"label": "personal", "email_pattern": "gmail.com"}
+    {"label": "work@example.com"},
+    {"label": "personal@gmail.com"}
   ],
   "active_account": "",
   "last_switch_time": 0,

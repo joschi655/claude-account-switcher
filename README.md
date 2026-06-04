@@ -43,15 +43,17 @@ Edit `~/.claude/auto-switch-config.json`:
 {
   "enabled": false,
   "threshold": 90,
+  "session_autostart_enabled": false,
+  "session_autostart_threshold": 70,
+  "session_autostart_hour": 6,
   "accounts": [
-    {"label": "work",     "email_pattern": "yourcompany.com"},
-    {"label": "personal", "email_pattern": "gmail.com"}
+    {"label": "work@example.com"},
+    {"label": "personal@gmail.com"}
   ]
 }
 ```
 
-- **`label`**: arbitrary name for the account (used for backup filenames)
-- **`email_pattern`**: substring matched against the account's email address
+- **`label`**: the full account email address (used for backup filenames and matching)
 
 ### 3. Save credentials for each account
 
@@ -60,8 +62,8 @@ For **each** account you want to use, you need to save its credentials while it 
 Run this once per account (while logged in as that account):
 
 ```bash
-# Replace "work" with your account label
-LABEL="work"
+# Replace with the full account email address
+LABEL="work@example.com"
 cp ~/.claude.json ~/.claude.json.$LABEL
 security find-generic-password -l "Claude Code-credentials" -w > ~/.claude-keychain-$LABEL.json
 ```
@@ -83,6 +85,45 @@ tail -f ~/.claude/auto-switch.log
 
 You should see `POLL: work=XX%` lines every minute (more frequently above 50%).
 
+## Session Autostart (Optional)
+
+You can let the switcher launch a cheap Claude CLI run automatically using a command like:
+
+```bash
+claude -p "test" \
+  --model haiku \
+  --allowedTools "Read" \
+  --max-turns 1 \
+  --output-format json
+```
+
+This is useful if you want to:
+
+1. Start the first lightweight session of the day at a fixed hour, such as 6:00.
+2. Trigger a new cheap run after a window is already heavily used, for example above 70%, once no interactive `claude` process is running anymore.
+
+Example config:
+
+```json
+{
+  "session_autostart_enabled": true,
+  "session_autostart_threshold": 70,
+  "session_autostart_hour": 6,
+  "session_autostart_prompt": "test",
+  "session_autostart_model": "haiku",
+  "session_autostart_allowed_tools": "Read",
+  "session_autostart_max_turns": 1,
+  "session_autostart_output_format": "json"
+}
+```
+
+Behavior:
+
+- Starts at most once per account per day after the configured hour.
+- Can also start once per reset window when utilization reaches the configured threshold.
+- Never starts while another `claude` process is already running.
+- Writes one log file per run to `~/.claude/session-autostart-<timestamp>.log`.
+
 ## Configuration Reference
 
 | Key | Default | Description |
@@ -91,6 +132,14 @@ You should see `POLL: work=XX%` lines every minute (more frequently above 50%).
 | `threshold` | `90` | Switch at this utilization % (0-100) |
 | `kitty_pause_on_switch` | `false` | Send pause/continue to Kitty terminal |
 | `resume_before_reset_hours` | `0.5` | Send "continue" this many hours before the old account resets |
+| `session_autostart_enabled` | `false` | Enable automatic cheap `claude -p` session starts |
+| `session_autostart_threshold` | `70` | Start a cheap run once utilization reaches this % |
+| `session_autostart_hour` | `6` | Earliest hour of day for the daily autostart |
+| `session_autostart_prompt` | `test` | Prompt used for the cheap autostart run |
+| `session_autostart_model` | `haiku` | Model used for the cheap autostart run |
+| `session_autostart_allowed_tools` | `Read` | Allowed tools string passed to `claude` |
+| `session_autostart_max_turns` | `1` | Max turns for the cheap autostart run |
+| `session_autostart_output_format` | `json` | Output format for the cheap autostart run |
 | `accounts` | `[]` | Ordered list of accounts to rotate through |
 | `active_account` | `""` | Managed automatically — current active label |
 | `last_switch_time` | `0` | Unix timestamp of last switch (cooldown tracking) |
@@ -119,7 +168,7 @@ Update the `find_kitty_socket` function in `claude-auto-switch.sh` to match your
 
 - Credentials are stored locally in `~/.claude-keychain-<label>.json` (raw OAuth tokens)
 - **Never commit these files** — they are in `.gitignore`
-- Tokens auto-refresh while Claude Code is active; the script refreshes the backup on every successful poll
+- Tokens auto-refresh while Claude Code is active; the script also refreshes backup tokens proactively on timer runs when they are close to expiry
 
 ## Logs
 
@@ -132,6 +181,7 @@ Log format: `YYYY-MM-DD HH:MM:SS LEVEL: message`
 | Level | Meaning |
 |-------|---------|
 | `POLL` | Utilization check result |
+| `SESSION` | Cheap Claude CLI session auto-started |
 | `SWITCH` | Account was switched |
 | `SKIP` | Switch skipped (reason follows) |
 | `WARN` | Non-fatal warning |
