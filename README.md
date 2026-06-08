@@ -2,6 +2,8 @@
 
 Automatically rotate between multiple Claude.ai Pro accounts when the current account hits the 5-hour utilization limit. Keeps Claude Code running continuously without manual intervention and session stays active while the account changes. Claude Code will just continue with its session.
 
+<img width="763" height="495" alt="Untitled" src="https://github.com/user-attachments/assets/78d22d14-fcd0-4a5a-9df6-3cea1e4f689b" />
+
 ## How It Works
 
 Claude.ai Pro has a 5-hour rolling usage window. When your current account reaches the configured threshold (default: 90%), the script:
