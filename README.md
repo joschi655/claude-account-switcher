@@ -124,6 +124,53 @@ Behavior:
 - Never starts while another `claude` process is already running.
 - Writes one log file per run to `~/.claude/session-autostart-<timestamp>.log`.
 
+## Ubuntu Auto-Continue For Interactive Sessions
+
+On Ubuntu you can now mark a specific Claude Code session so it automatically receives `continue` once the current account window resets.
+
+This no longer depends on Kitty sockets. The switcher resolves the active Claude `sessionId` from `~/.claude/sessions/*.json`, looks up the last used model from the persisted JSONL session log, and resumes with `--dangerously-skip-permissions`.
+
+Run this inside the session directory you want to resume later:
+
+```bash
+claude-auto-switch.sh register-auto-continue hermes-main
+```
+
+What it does:
+
+- Uses the current Claude account label by default.
+- Resolves the active Claude session for the current working directory.
+- Reuses the last model that session actually used.
+- Resumes with `claude --resume <session-id> --model <last-model> --dangerously-skip-permissions -p "continue"`.
+- Falls back to the known reset time from the local usage caches.
+- Stores the registration in `~/.claude/session-autostart-state.json`.
+- When the timer script next sees that the reset time has passed, it sends `continue` back into that exact Claude session.
+
+Useful commands:
+
+```bash
+# Register the active Claude session in the current directory for auto-continue after reset
+claude-auto-switch.sh register-auto-continue hermes-main
+
+# Explicit form: session name, account label, session id, continue text, reset_at
+claude-auto-switch.sh register-auto-continue hermes-main work@example.com 9ecf0422-9d1b-4655-a08a-b681d2ebf40e continue 2026-06-07T18:30:00+00:00
+
+# Inspect active Claude sessions the switcher can target
+claude-auto-switch.sh list-active-sessions
+
+# Show scheduled auto-continue sessions
+claude-auto-switch.sh list-auto-continue
+
+# Remove one scheduled auto-continue session
+claude-auto-switch.sh clear-auto-continue hermes-main
+```
+
+Requirements:
+
+- The timer/service must keep running on Ubuntu so the due `continue` can be delivered.
+- The target Claude session must already have written a persisted session record and at least one model-bearing response.
+- If no reset time is known yet, run a usage refresh first: `claude-auto-switch.sh refresh-usage-cache-all`.
+
 ## Configuration Reference
 
 | Key | Default | Description |
@@ -140,6 +187,7 @@ Behavior:
 | `session_autostart_allowed_tools` | `Read` | Allowed tools string passed to `claude` |
 | `session_autostart_max_turns` | `1` | Max turns for the cheap autostart run |
 | `session_autostart_output_format` | `json` | Output format for the cheap autostart run |
+| `preferred_return_threshold` | `70` | Prefer switching back to the first account in config order once it is below this utilization |
 | `accounts` | `[]` | Ordered list of accounts to rotate through |
 | `active_account` | `""` | Managed automatically — current active label |
 | `last_switch_time` | `0` | Unix timestamp of last switch (cooldown tracking) |
