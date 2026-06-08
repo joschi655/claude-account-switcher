@@ -1,6 +1,6 @@
-# Claude Account Switcher
+# Claude Code auto Account Switcher
 
-Automatically rotate between multiple Claude.ai Pro accounts when the current account hits the 5-hour utilization limit. Keeps Claude Code running continuously without manual intervention.
+Automatically rotate between multiple Claude.ai Pro accounts when the current account hits the 5-hour utilization limit. Keeps Claude Code running continuously without manual intervention and session stays active while the account changes. Claude Code will just continue with its session.
 
 ## How It Works
 
