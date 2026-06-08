@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Claude Auto Switch every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=com.claude.auto-switch.service
+
+[Install]
+WantedBy=timers.target

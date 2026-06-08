@@ -11,6 +11,7 @@
   "session_autostart_allowed_tools": "Read",
   "session_autostart_max_turns": 1,
   "session_autostart_output_format": "json",
+  "preferred_return_threshold": 70,
   "accounts": [
     {"label": "work@example.com"},
     {"label": "personal@gmail.com"}

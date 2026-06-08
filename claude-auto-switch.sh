@@ -1690,9 +1690,11 @@ maybe_run_auto_continue_sessions
 
 # Fetch usage for current account
 CUR_TOKEN=$(get_token "$CUR_LABEL")
+CURRENT_POLL_STATUS="ok"
 read -r UTIL RESETS_AT <<< $(fetch_usage "$CUR_TOKEN")
 
 if [ "$UTIL" -eq -1 ] 2>/dev/null; then
+  CURRENT_POLL_STATUS="api_error"
   # API failed — use cached value, skip poll timer update
   log "POLL: API error for $CUR_LABEL — using cache"
   read -r UTIL RESETS_AT <<< $(python3 -c "
@@ -1742,6 +1744,19 @@ if [ -n "$PREFERRED_TARGET" ] && [ "$PREFERRED_TARGET" != "$CUR_LABEL" ]; then
   else
     update_usage_cache "$PREFERRED_TARGET" "__KEEP__" "__KEEP__" "$PREFERRED_STATUS" "priority-return" "__KEEP__" "__KEEP__"
   fi
+fi
+
+if [ "$CURRENT_POLL_STATUS" != "ok" ]; then
+  TARGET_INFO=$(find_ordered_switch_target "$CUR_LABEL" "$THRESHOLD")
+  if [ -z "$TARGET_INFO" ]; then
+    pause_all_sessions_for_full_capacity "$CUR_LABEL" "$RESETS_AT"
+    log "SKIP: no usable account available after current account poll failure — current=$CUR_LABEL"
+    exit 0
+  fi
+
+  IFS='|' read -r TARGET TARGET_UTIL TARGET_RESETS_AT <<< "$TARGET_INFO"
+  perform_switch "$CUR_LABEL" "$UTIL" "$RESETS_AT" "$TARGET" "$TARGET_UTIL" "$NOW" "api-error"
+  exit 0
 fi
 
 # ── Threshold check → Switch ──

@@ -1,0 +1,7 @@
+[Unit]
+Description=Claude Auto Switch timer job
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash INSTALL_PATH/claude-auto-switch.sh
+WorkingDirectory=INSTALL_PATH
