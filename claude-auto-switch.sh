@@ -319,19 +319,65 @@ if os.path.exists(path):
 " 2>/dev/null
 }
 
+# sha256[:16] of a backup's current refresh token (matches write_backup_metadata).
+backup_refresh_hash() {
+  local LABEL="$1"
+  python3 -c "
+import hashlib, json
+try:
+    rt = json.load(open('$(keychain_backup "$LABEL")')).get('claudeAiOauth', {}).get('refreshToken', '')
+    print(hashlib.sha256(rt.encode()).hexdigest()[:16] if rt else '')
+except Exception:
+    print('')
+" 2>/dev/null
+}
+
 # Mark/clear "this account's token chain was donated to the remote — log in again
-# locally to get a fresh independent chain". Surfaced by SwiftBar as a reminder so
-# a donate is never silently forgotten.
+# locally to get a fresh independent chain". Records the donated hash so a later
+# local re-login (which changes the hash) auto-clears the flag — no manual save
+# needed. Surfaced by SwiftBar so a donate is never silently forgotten.
 set_needs_local_relogin() {
   local LABEL="$1"
+  local DONATED_HASH
+  DONATED_HASH=$(backup_refresh_hash "$LABEL")
   python3 -c "
 import json, os, time
 path = '$USAGE_CACHE'
 state = json.load(open(path)) if os.path.exists(path) else {'accounts': {}}
 entry = state.setdefault('accounts', {}).setdefault('$LABEL', {'label': '$LABEL'})
 entry['needs_local_relogin'] = int(time.time())
+entry['donated_refresh_hash'] = '$DONATED_HASH'
 json.dump(state, open(path, 'w'), indent=2)
 " 2>/dev/null
+}
+
+# Auto-clear needs_local_relogin once the local backup's refresh hash differs from
+# the donated one — i.e. a fresh independent login has replaced the shared chain.
+detect_local_relogin() {
+  python3 -c "
+import json, os
+path = '$USAGE_CACHE'
+if not os.path.exists(path):
+    raise SystemExit(0)
+for label, e in json.load(open(path)).get('accounts', {}).items():
+    if isinstance(e, dict) and e.get('needs_local_relogin') and e.get('donated_refresh_hash'):
+        print(label)
+" 2>/dev/null | while IFS= read -r LBL; do
+    [ -z "$LBL" ] && continue
+    local CUR_HASH DONATED
+    CUR_HASH=$(backup_refresh_hash "$LBL")
+    DONATED=$(python3 -c "import json; print(json.load(open('$USAGE_CACHE'))['accounts'].get('$LBL',{}).get('donated_refresh_hash',''))" 2>/dev/null)
+    if [ -n "$CUR_HASH" ] && [ "$CUR_HASH" != "$DONATED" ]; then
+      clear_needs_local_relogin "$LBL"
+      clear_refresh_dead "$LBL"
+      python3 -c "
+import json
+s=json.load(open('$USAGE_CACHE')); e=s['accounts'].get('$LBL',{})
+e.pop('donated_refresh_hash', None); json.dump(s,open('$USAGE_CACHE','w'),indent=2)
+" 2>/dev/null
+      log "REPAIR: detected fresh local login for $LBL — cleared re-login reminder"
+    fi
+  done
 }
 
 clear_needs_local_relogin() {
@@ -2463,6 +2509,9 @@ esac
 CUR_EMAIL=$(current_account_email)
 CUR_LABEL=$(account_label "$CUR_EMAIL")
 [ "$CUR_LABEL" != "unknown" ] && save_current_credentials "$CUR_LABEL"
+
+# Auto-clear any stale "re-login needed" reminder once a fresh local login is detected.
+detect_local_relogin
 
 # Keep backup tokens fresh on every timer run, independent of auto-switch state.
 refresh_all_tokens
