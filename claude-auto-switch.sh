@@ -178,6 +178,147 @@ json.dump(state, open(path, 'w'), indent=2)
 " 2>/dev/null
 }
 
+# Set/escalate the per-account 429 backoff (90s → 180s → 360s → 720s, cap 900s).
+# All usage reads go through get_usage_for_label, which serves stale cache while
+# backoff_until is in the future — so a throttled account is left alone to recover.
+bump_usage_backoff() {
+  local LABEL="$1"
+  python3 -c "
+import json, os, time
+path = '$USAGE_CACHE'
+state = json.load(open(path)) if os.path.exists(path) else {'accounts': {}}
+entry = state.setdefault('accounts', {}).setdefault('$LABEL', {'label': '$LABEL'})
+step = min(max(int(entry.get('backoff_s', 0)) * 2, 90), 900)
+entry['backoff_s'] = step
+entry['backoff_until'] = int(time.time()) + step
+json.dump(state, open(path, 'w'), indent=2)
+print(step)
+" 2>/dev/null
+}
+
+clear_usage_backoff() {
+  local LABEL="$1"
+  python3 -c "
+import json, os, time
+path = '$USAGE_CACHE'
+state = json.load(open(path)) if os.path.exists(path) else {'accounts': {}}
+entry = state.setdefault('accounts', {}).setdefault('$LABEL', {'label': '$LABEL'})
+entry.pop('backoff_s', None)
+entry.pop('backoff_until', None)
+json.dump(state, open(path, 'w'), indent=2)
+" 2>/dev/null
+}
+
+# Cache-first usage lookup — THE single entry point for usage data.
+# Echoes: STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT SOURCE
+# Serves the cross-device-synced cache when fresh enough, respects per-account
+# 429 backoff, and only then hits the usage API (updating cache + backoff state).
+get_usage_for_label() {
+  local LABEL="$1"
+  local MAX_AGE="${2:-300}"
+  local CACHED
+  CACHED=$(python3 -c "
+import json, os, time
+path = '$USAGE_CACHE'
+try:
+    entry = json.load(open(path)).get('accounts', {}).get('$LABEL', {})
+except Exception:
+    entry = {}
+def out(status, src):
+    util = entry.get('utilization')
+    seven = entry.get('seven_day_utilization')
+    print(status,
+          util if util is not None else 'none',
+          entry.get('resets_at') or 'none',
+          seven if seven is not None else 'none',
+          entry.get('seven_day_resets_at') or 'none',
+          src)
+age_ms = time.time() * 1000 - entry.get('checked_at', 0)
+if entry.get('status') == 'ok' and entry.get('utilization') is not None and age_ms < $MAX_AGE * 1000:
+    out('ok', 'cache')
+elif entry.get('backoff_until', 0) > time.time():
+    out('rate_limited', 'backoff')
+else:
+    print('MISS')
+" 2>/dev/null)
+  if [ -n "$CACHED" ] && [ "$CACHED" != "MISS" ]; then
+    echo "$CACHED"
+    return 0
+  fi
+  local TOKEN STATUS UTIL RESETS_AT SEVEN SEVEN_AT
+  TOKEN=$(get_token "$LABEL")
+  read -r STATUS UTIL RESETS_AT SEVEN SEVEN_AT <<< $(fetch_usage_detailed "$TOKEN")
+  if [ "$STATUS" = "ok" ]; then
+    update_usage_cache "$LABEL" "$UTIL" "$RESETS_AT" "ok" "fetch" "$SEVEN" "$SEVEN_AT"
+    clear_usage_backoff "$LABEL"
+  elif [ "$STATUS" = "rate_limited" ]; then
+    update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "rate_limited" "fetch" "__KEEP__" "__KEEP__"
+    local STEP
+    STEP=$(bump_usage_backoff "$LABEL")
+    log "POLL: 429 for $LABEL — backing off ${STEP}s"
+  else
+    update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "$STATUS" "fetch" "__KEEP__" "__KEEP__"
+  fi
+  echo "$STATUS $UTIL $RESETS_AT $SEVEN $SEVEN_AT live"
+}
+
+# Read-only peek at the cached entry for a label (no API call ever).
+# Echoes: STATUS UTIL RESETS_AT AGE_SECONDS
+peek_cached_usage() {
+  local LABEL="$1"
+  python3 -c "
+import json, os, time
+path = '$USAGE_CACHE'
+try:
+    entry = json.load(open(path)).get('accounts', {}).get('$LABEL', {})
+except Exception:
+    entry = {}
+util = entry.get('utilization')
+age = int(time.time() - entry.get('checked_at', 0) / 1000) if entry.get('checked_at') else 999999
+print(entry.get('status', 'none'), util if util is not None else 'none', entry.get('resets_at') or 'none', age)
+" 2>/dev/null || echo "none none none 999999"
+}
+
+# Dead-account refresh gate: once a refresh token is confirmed invalid, retry at
+# most once per hour instead of every 60s tick (kills log spam + extra API calls).
+refresh_dead_until() {
+  local LABEL="$1"
+  python3 -c "
+import json, os
+path = '$USAGE_CACHE'
+try:
+    print(int(json.load(open(path)).get('accounts', {}).get('$LABEL', {}).get('refresh_dead_until', 0)))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0
+}
+
+set_refresh_dead_until() {
+  local LABEL="$1"
+  local SECONDS_AHEAD="${2:-3600}"
+  python3 -c "
+import json, os, time
+path = '$USAGE_CACHE'
+state = json.load(open(path)) if os.path.exists(path) else {'accounts': {}}
+entry = state.setdefault('accounts', {}).setdefault('$LABEL', {'label': '$LABEL'})
+entry['refresh_dead_until'] = int(time.time()) + $SECONDS_AHEAD
+json.dump(state, open(path, 'w'), indent=2)
+" 2>/dev/null
+}
+
+clear_refresh_dead() {
+  local LABEL="$1"
+  python3 -c "
+import json, os
+path = '$USAGE_CACHE'
+if os.path.exists(path):
+    state = json.load(open(path))
+    entry = state.get('accounts', {}).get('$LABEL')
+    if entry and entry.pop('refresh_dead_until', None) is not None:
+        json.dump(state, open(path, 'w'), indent=2)
+" 2>/dev/null
+}
+
 next_usage_refresh_label() {
   local CURRENT_LABEL="$1"
   python3 -c "
@@ -289,17 +430,16 @@ find_ordered_switch_target() {
       update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "missing_credentials" "ordered-target"
       continue
     fi
-    local TOKEN STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT
-    TOKEN=$(get_token "$LABEL")
-    read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT <<< $(fetch_usage_detailed "$TOKEN")
+    # Cache-first (10 min tolerance): candidate ranking doesn't need second-fresh
+    # data, and polling every candidate on each switch attempt burns the per-account
+    # usage-API rate budget.
+    local STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT USAGE_SOURCE
+    read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT USAGE_SOURCE <<< $(get_usage_for_label "$LABEL" 600)
     if [ "$STATUS" = "ok" ]; then
-      update_usage_cache "$LABEL" "$UTIL" "$RESETS_AT" "ok" "ordered-target" "$SEVEN_DAY_UTIL" "$SEVEN_DAY_RESETS_AT"
       if [ "$UTIL" -lt "$LIMIT" ] 2>/dev/null; then
         echo "$LABEL|$UTIL|$RESETS_AT"
         return 0
       fi
-    else
-      update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "$STATUS" "ordered-target" "__KEEP__" "__KEEP__"
     fi
   done < <(all_account_labels)
   return 1
@@ -577,6 +717,10 @@ refresh_all_tokens() {
     if [ "$LABEL" = "$CURRENT_LABEL" ] && [ "$CLAUDE_RUNNING" = "yes" ]; then
       continue
     fi
+    # Dead refresh token: don't hammer the token endpoint every tick — retry hourly.
+    if [ "$(refresh_dead_until "$LABEL")" -gt "$(date +%s)" ]; then
+      continue
+    fi
     local RESULT
     RESULT=$(refresh_backup_token "$LABEL" 2>&1)
     if [ -n "$RESULT" ]; then
@@ -584,16 +728,27 @@ refresh_all_tokens() {
       audit_refresh_event "$LABEL" "$RESULT"
       case "$RESULT" in
         *"Refresh token not found or invalid"*|*"reason=no_refresh_token"*)
+          set_refresh_dead_until "$LABEL" 3600
           if [ "$LABEL" != "$CURRENT_LABEL" ]; then
-            local TOKEN STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT
-            TOKEN=$(get_token_raw "$LABEL")
-            read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT <<< $(fetch_usage_detailed "$TOKEN")
-            if [ "$STATUS" = "ok" ]; then
-              update_usage_cache "$LABEL" "$UTIL" "$RESETS_AT" "ok" "backup" "$SEVEN_DAY_UTIL" "$SEVEN_DAY_RESETS_AT"
-            elif [ "$STATUS" = "rate_limited" ]; then
-              update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "rate_limited" "backup" "__KEEP__" "__KEEP__"
-            else
+            # Refresh token is dead, but the access token may still be valid for a
+            # while — check (cache-first) so the status display stays accurate.
+            local STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT USAGE_SOURCE
+            read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT USAGE_SOURCE <<< $(get_usage_for_label "$LABEL" 600)
+            if [ "$STATUS" != "ok" ] && [ "$STATUS" != "rate_limited" ]; then
               update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "unauthorized" "refresh-audit"
+            fi
+          fi
+          ;;
+        REFRESHED*)
+          clear_refresh_dead "$LABEL"
+          # Active account refreshed while Claude is closed: mirror the new token
+          # into the live store so the next Claude/PAI launch never sees a stale,
+          # already-consumed refresh token (= no more login prompts).
+          if [ "$LABEL" = "$CURRENT_LABEL" ]; then
+            if write_live_credentials_from_backup "$LABEL"; then
+              log "TOKEN: $LABEL: wrote refreshed token to live store"
+            else
+              log "WARN: $LABEL: failed to write refreshed token to live store"
             fi
           fi
           ;;
@@ -671,8 +826,10 @@ local_accts = local_d.get('accounts', {}) if isinstance(local_d, dict) else {}
 remote_accts = remote_d.get('accounts', {}) if isinstance(remote_d, dict) else {}
 merged = dict(local_accts)
 for k, rv in remote_accts.items():
-    rt = rv.get('timestamp', 0)
-    lt = local_accts.get(k, {}).get('timestamp', 0)
+    # Entries are stamped with checked_at (ms) by update_usage_cache —
+    # the newer reading wins, regardless of which device produced it.
+    rt = rv.get('checked_at', 0)
+    lt = local_accts.get(k, {}).get('checked_at', 0)
     if rt > lt:
         merged[k] = rv
 out = dict(local_d) if isinstance(local_d, dict) else {}
@@ -985,6 +1142,8 @@ trigger_limit_for_label() {
   fi
 
   # Minimal Messages API request: opens a fresh 5h window for this account.
+  # Bonus: Messages responses carry anthropic-ratelimit-unified-* headers with
+  # the 5h utilization — usage data with ZERO usage-endpoint calls. Harvest it.
   local RESULT
   RESULT=$(python3 -c "
 import urllib.request, urllib.error, json
@@ -1003,25 +1162,52 @@ req = urllib.request.Request(
     'anthropic-beta': 'oauth-2025-04-20'
   }
 )
+def ratelimit_headers(headers):
+  pairs = [f'{k.lower()}={v}' for k, v in headers.items() if k.lower().startswith('anthropic-ratelimit')]
+  return ';'.join(pairs)
 try:
   with urllib.request.urlopen(req, timeout=15) as r:
     json.loads(r.read())
-    print('ok')
+    print('ok|' + ratelimit_headers(r.headers))
 except urllib.error.HTTPError as e:
   # 429 = already rate-limited (window is open, that's fine). Others = real error.
   if e.code == 429:
-    print('ok')
+    print('ok|' + ratelimit_headers(e.headers))
   else:
-    print(f'http_{e.code}')
+    print(f'http_{e.code}|')
 except Exception as ex:
-  print(f'error_{type(ex).__name__}')
+  print(f'error_{type(ex).__name__}|')
 " 2>/dev/null)
 
-  if [ "$RESULT" = "ok" ]; then
+  local STATUS_PART HEADERS_PART
+  STATUS_PART="${RESULT%%|*}"
+  HEADERS_PART="${RESULT#*|}"
+  if [ -n "$HEADERS_PART" ]; then
+    log "LIMIT: ratelimit headers for $LABEL: $HEADERS_PART"
+    # If the unified headers expose 5h utilization/reset, feed the usage cache.
+    python3 -c "
+import time
+headers = dict(p.split('=', 1) for p in '$HEADERS_PART'.split(';') if '=' in p)
+util = None
+reset = ''
+for k, v in headers.items():
+    if 'utilization' in k and '5h' in k:
+        try: util = int(float(v) * 100) if float(v) <= 1 else int(float(v))
+        except ValueError: pass
+    if k.endswith('-reset') and '5h' in k:
+        reset = v
+if util is not None:
+    print(f'{util}|{reset}')
+" 2>/dev/null | while IFS='|' read -r H_UTIL H_RESET; do
+      [ -n "$H_UTIL" ] && update_usage_cache "$LABEL" "$H_UTIL" "${H_RESET:-__KEEP__}" "ok" "messages-headers" "__KEEP__" "__KEEP__"
+    done
+  fi
+
+  if [ "$STATUS_PART" = "ok" ]; then
     log "LIMIT: triggered 5h window for $LABEL (direct API)"
     return 0
   else
-    log "LIMIT: trigger FAILED for $LABEL — $RESULT"
+    log "LIMIT: trigger FAILED for $LABEL — $STATUS_PART"
     return 1
   fi
 }
@@ -1031,14 +1217,9 @@ refresh_next_usage_cache() {
   local NEXT_LABEL
   NEXT_LABEL=$(next_usage_refresh_label "$CURRENT_LABEL")
   [ -z "$NEXT_LABEL" ] && return 0
-  local TOKEN STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT
-  TOKEN=$(get_token "$NEXT_LABEL")
-  read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT <<< $(fetch_usage_detailed "$TOKEN")
-  if [ "$STATUS" = "ok" ]; then
-    update_usage_cache "$NEXT_LABEL" "$UTIL" "$RESETS_AT" "ok" "backup" "$SEVEN_DAY_UTIL" "$SEVEN_DAY_RESETS_AT"
-  else
-    update_usage_cache "$NEXT_LABEL" "__KEEP__" "__KEEP__" "$STATUS" "backup" "__KEEP__" "__KEEP__"
-  fi
+  # Cache-first round-robin: skips the API entirely when the other device
+  # already refreshed this account in the last 10 minutes.
+  get_usage_for_label "$NEXT_LABEL" 600 >/dev/null
 }
 
 refresh_all_usage_cache() {
@@ -1048,16 +1229,9 @@ refresh_all_usage_cache() {
       update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "missing_credentials" "full-refresh"
       continue
     fi
-    local TOKEN STATUS UTIL RESETS_AT SOURCE
-    TOKEN=$(get_token "$LABEL")
-    read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT <<< $(fetch_usage_detailed "$TOKEN")
-    SOURCE="backup"
-    [ "$LABEL" = "$(account_label "$(current_account_email)")" ] && SOURCE="live"
-    if [ "$STATUS" = "ok" ]; then
-      update_usage_cache "$LABEL" "$UTIL" "$RESETS_AT" "ok" "$SOURCE" "$SEVEN_DAY_UTIL" "$SEVEN_DAY_RESETS_AT"
-    else
-      update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "$STATUS" "$SOURCE" "__KEEP__" "__KEEP__"
-    fi
+    # 30s tolerance: manual refresh still pulls fresh data, but respects the
+    # per-account 429 backoff and doesn't double-hit just-polled accounts.
+    get_usage_for_label "$LABEL" 30 >/dev/null
   done < <(all_account_labels)
 }
 
@@ -1072,13 +1246,9 @@ start_all_sessions() {
       SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       continue
     fi
-    local TOKEN STATUS UTIL RESETS_AT
-    TOKEN=$(get_token "$LABEL")
-      read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT <<< $(fetch_usage_detailed "$TOKEN")
-    if [ "$STATUS" = "ok" ]; then
-        update_usage_cache "$LABEL" "$UTIL" "$RESETS_AT" "ok" "start-all" "$SEVEN_DAY_UTIL" "$SEVEN_DAY_RESETS_AT"
-    else
-        update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "$STATUS" "start-all" "__KEEP__" "__KEEP__"
+    local STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT USAGE_SOURCE
+    read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT USAGE_SOURCE <<< $(get_usage_for_label "$LABEL" 300)
+    if [ "$STATUS" != "ok" ]; then
       log "SESSION: start-all skip $LABEL — usage status $STATUS"
       SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       continue
@@ -1115,16 +1285,13 @@ restart_all_sessions() {
       SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       continue
     fi
-    local TOKEN STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT
-    TOKEN=$(get_token "$LABEL")
-    read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT <<< $(fetch_usage_detailed "$TOKEN")
+    local STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT USAGE_SOURCE
+    read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT USAGE_SOURCE <<< $(get_usage_for_label "$LABEL" 300)
     if [ "$STATUS" != "ok" ]; then
-      update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "$STATUS" "restart-all" "__KEEP__" "__KEEP__"
       log "LIMIT: restart-all skip $LABEL — usage status $STATUS"
       SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       continue
     fi
-    update_usage_cache "$LABEL" "$UTIL" "$RESETS_AT" "ok" "restart-all" "$SEVEN_DAY_UTIL" "$SEVEN_DAY_RESETS_AT"
 
     if [ "$UTIL" -lt "$SESSION_AUTOSTART_THRESHOLD" ] 2>/dev/null; then
       # Limit has reset or is low — trigger NOW
@@ -1276,6 +1443,36 @@ sys.stdout.buffer.write(payload)
     [ -f "$LINUX_CREDENTIALS" ] && cp "$LINUX_CREDENTIALS" "$(keychain_backup "$LABEL")"
   fi
   write_backup_metadata "$LABEL" "$REASON"
+}
+
+# Write a label's backup credential into the LIVE store (Keychain on macOS,
+# ~/.claude/.credentials.json on Linux) WITHOUT touching ~/.claude.json.
+# Used after refreshing the ACTIVE account's token so the live store and the
+# backup never diverge — the root cause of the recurring "login needed" prompts
+# (OAuth refresh tokens are single-use; rotating the backup invalidates the
+# token still sitting in the live store).
+write_live_credentials_from_backup() {
+  local LABEL="$1"
+  local KEYCHAIN_FILE
+  KEYCHAIN_FILE=$(keychain_backup "$LABEL")
+  [ ! -f "$KEYCHAIN_FILE" ] && return 1
+  if [ "$OS_TYPE" = "Darwin" ]; then
+    local KEYCHAIN_DATA
+    KEYCHAIN_DATA=$(python3 -c "
+import binascii, sys
+raw = open('$KEYCHAIN_FILE', 'rb').read().strip()
+payload = raw
+if raw.lstrip().startswith(b'{'):
+    payload = binascii.hexlify(raw)
+sys.stdout.write(payload.decode())
+")
+    security delete-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" 2>/dev/null || true
+    security add-generic-password -U -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" \
+      -l "$KEYCHAIN_SERVICE" -w "$KEYCHAIN_DATA" >/dev/null 2>&1 || return 1
+  else
+    cp "$KEYCHAIN_FILE" "$LINUX_CREDENTIALS"
+  fi
+  return 0
 }
 
 restore_credentials() {
@@ -1961,33 +2158,43 @@ schedule_resume() {
   [ -n "$RESUME_TIME" ] && echo "$RESUME_TIME" > "$HOME/.claude/auto-switch-resume-time.txt"
 }
 
-# ── Adaptive polling: 60s when Claude Code is running, 300s otherwise ──
+# ── Adaptive polling: cadence scales with utilization so the 90% crossing is
+# caught within one tick, while low-utilization accounts barely touch the API ──
 should_poll() {
-  local LAST_UTIL LAST_POLL_TIME THROTTLED_AT
+  local LAST_UTIL LAST_POLL_TIME THROTTLED_AT THROTTLE_COUNT
   if [ -f "$LAST_POLL_FILE" ]; then
-    read -r LAST_UTIL LAST_POLL_TIME THROTTLED_AT <<< $(python3 -c "
+    read -r LAST_UTIL LAST_POLL_TIME THROTTLED_AT THROTTLE_COUNT <<< $(python3 -c "
 import json
 d = json.load(open('$LAST_POLL_FILE'))
-print(d.get('util', 0), d.get('time', 0), d.get('throttled_at', 0))
-" 2>/dev/null || echo "0 0 0")
+print(d.get('util', 0), d.get('time', 0), d.get('throttled_at', 0), d.get('throttle_count', 0))
+" 2>/dev/null || echo "0 0 0 0")
   else
     echo "yes"; return
   fi
   local NOW ELAPSED
   NOW=$(date +%s)
-  # 429 backoff: wait ~90s for the usage-API throttle to clear, then retry to get
-  # a real reading. Short enough that we won't miss a genuine climb past 90%.
+  # 429 backoff: exponential per consecutive throttle (90s, 180s, 360s, 720s, cap 900s).
+  # The first retry stays short so a genuine climb past 90% isn't missed.
   if [ "${THROTTLED_AT:-0}" -gt 0 ]; then
+    local BACKOFF=90
+    local C="${THROTTLE_COUNT:-1}"
+    [ "$C" -lt 1 ] && C=1
+    local I=1
+    while [ "$I" -lt "$C" ] && [ "$BACKOFF" -lt 900 ]; do
+      BACKOFF=$((BACKOFF * 2)); I=$((I + 1))
+    done
+    [ "$BACKOFF" -gt 900 ] && BACKOFF=900
     ELAPSED=$((NOW - THROTTLED_AT))
-    [ "$ELAPSED" -lt 90 ] && echo "no" && return
+    [ "$ELAPSED" -lt "$BACKOFF" ] && echo "no" && return
   fi
   ELAPSED=$((NOW - LAST_POLL_TIME))
   local INTERVAL
   # The usage API throttles after ~2 rapid requests per account, so 60s (the
-  # launchd tick floor) is the fastest safe rate. Poll every tick when near the
-  # limit to catch the 90% crossing; back off when low to avoid needless calls.
-  if [ "${LAST_UTIL:-0}" -ge 70 ] 2>/dev/null; then
+  # launchd tick floor) is the fastest safe rate. Cadence by utilization:
+  if [ "${LAST_UTIL:-0}" -ge 75 ] 2>/dev/null; then
     INTERVAL=60    # Near the limit: poll every tick to catch the 90% crossing
+  elif [ "${LAST_UTIL:-0}" -ge 50 ] 2>/dev/null; then
+    INTERVAL=120   # Mid-range: every 2 minutes
   elif claude_session_active; then
     INTERVAL=120   # Conversation active (JSONL written in last 2 min): every 2 minutes
   else
@@ -2007,6 +2214,8 @@ get_token() {
   local SKIP_REFRESH="no"
   [ "$LABEL" = "$CURRENT_LABEL" ] && claude_process_running && SKIP_REFRESH="yes"
   [ "$OS_TYPE" = "Linux" ] && [ "$LABEL" = "$CURRENT_LABEL" ] && [ -f "$LINUX_CREDENTIALS" ] && SKIP_REFRESH="yes"
+  # Known-dead refresh token: don't re-attempt the refresh on every read
+  [ "$(refresh_dead_until "$LABEL")" -gt "$(date +%s)" ] && SKIP_REFRESH="yes"
   [ "$SKIP_REFRESH" = "no" ] && { refresh_backup_token "$LABEL" >/dev/null 2>&1 || true; }
   get_token_raw "$LABEL"
 }
@@ -2058,7 +2267,11 @@ case "$1" in
       exit 1
     fi
     save_current_credentials "$CUR_LABEL" "manual-save"
-    exit $?
+    SAVE_RC=$?
+    # A fresh login replaces the refresh chain — clear dead/backoff state
+    clear_refresh_dead "$CUR_LABEL"
+    clear_usage_backoff "$CUR_LABEL"
+    exit $SAVE_RC
     ;;
   restore)
     if [ -z "$2" ]; then
@@ -2080,6 +2293,62 @@ case "$1" in
     # Direct API ping — opens the target's 5h window without touching the live login
     trigger_limit_for_label "$2"
     exit $?
+    ;;
+  repair-remote)
+    # Repair a dead account on the remote machine by donating this machine's
+    # working credential bundle. The refresh-token chain moves to the remote;
+    # this machine should be re-logged-in for the label afterwards (easier than
+    # logging in on a headless server).
+    REPAIR_LABEL="$2"
+    if [ -z "$REPAIR_LABEL" ]; then
+      echo "Usage: $0 repair-remote <label>"
+      exit 1
+    fi
+    if [ -z "$REMOTE_HOST" ]; then
+      echo "repair-remote: no remote_host configured"
+      exit 1
+    fi
+    if ! credentials_ready "$REPAIR_LABEL"; then
+      log "REPAIR: no local credential backup for $REPAIR_LABEL"
+      echo "repair-remote: no local backup for $REPAIR_LABEL"
+      exit 1
+    fi
+    # Make sure we donate a fresh token (skip if active account while Claude runs)
+    REPAIR_CUR_LABEL=$(account_label "$(current_account_email)")
+    if [ "$REPAIR_LABEL" = "$REPAIR_CUR_LABEL" ] && claude_process_running; then
+      log "REPAIR: $REPAIR_LABEL is the active account with Claude running — donating as-is (no refresh)"
+    else
+      refresh_backup_token "$REPAIR_LABEL" >/dev/null 2>&1 || true
+    fi
+    if scp -o ConnectTimeout=5 "$HOME/.claude-keychain-$REPAIR_LABEL.json" "$REMOTE_HOST":~/.claude-keychain-"$REPAIR_LABEL".json 2>/dev/null && \
+       scp -o ConnectTimeout=5 "$HOME/.claude.json.$REPAIR_LABEL" "$REMOTE_HOST":~/.claude.json."$REPAIR_LABEL" 2>/dev/null; then
+      [ ! -f "$HOME/.claude-meta-$REPAIR_LABEL.json" ] || scp -o ConnectTimeout=5 "$HOME/.claude-meta-$REPAIR_LABEL.json" "$REMOTE_HOST":~/.claude-meta-"$REPAIR_LABEL".json 2>/dev/null
+      # Tell the remote to retry refreshes immediately and clear its dead/unauthorized state
+      ssh -o ConnectTimeout=5 "$REMOTE_HOST" "python3 -c \"
+import json, os
+p = os.path.expanduser('~/.claude/account-usage-cache.json')
+if os.path.exists(p):
+    s = json.load(open(p))
+    e = s.get('accounts', {}).get('$REPAIR_LABEL')
+    if e:
+        e.pop('refresh_dead_until', None)
+        e.pop('backoff_until', None)
+        e.pop('backoff_s', None)
+        e['status'] = 'ok' if e.get('utilization') is not None else e.get('status', '')
+        json.dump(s, open(p, 'w'), indent=2)
+\"" 2>/dev/null
+      # The donated refresh chain now belongs to the remote — stop rotating it
+      # locally until a fresh local login replaces it (the save subcommand clears this).
+      set_refresh_dead_until "$REPAIR_LABEL" 86400
+      log "REPAIR: donated credential bundle for $REPAIR_LABEL to $REMOTE_HOST — re-login locally for this account when convenient"
+      echo "Donated $REPAIR_LABEL to $REMOTE_HOST. Now re-login on THIS machine for $REPAIR_LABEL (then run: $0 save $REPAIR_LABEL)."
+      osascript -e "display notification \"$REPAIR_LABEL repaired on remote. Re-login locally, then Save.\" with title \"Claude Auto-Switch\"" 2>/dev/null
+      exit 0
+    else
+      log "REPAIR: scp to $REMOTE_HOST failed for $REPAIR_LABEL"
+      echo "repair-remote: transfer to $REMOTE_HOST failed"
+      exit 1
+    fi
     ;;
   register-auto-continue)
     register_auto_continue "$2" "$3" "$4" "$5" "$6"
@@ -2106,13 +2375,7 @@ case "$1" in
     CUR_LABEL=$(account_label "$CUR_EMAIL")
     [ "$CUR_LABEL" != "unknown" ] && save_current_credentials "$CUR_LABEL"
     if [ -n "$CUR_LABEL" ] && [ "$CUR_LABEL" != "unknown" ]; then
-      CUR_TOKEN=$(get_token "$CUR_LABEL")
-      read -r CUR_STATUS CUR_UTIL CUR_RESETS_AT CUR_SEVEN_DAY_UTIL CUR_SEVEN_DAY_RESETS_AT <<< $(fetch_usage_detailed "$CUR_TOKEN")
-      if [ "$CUR_STATUS" = "ok" ]; then
-        update_usage_cache "$CUR_LABEL" "$CUR_UTIL" "$CUR_RESETS_AT" "ok" "live" "$CUR_SEVEN_DAY_UTIL" "$CUR_SEVEN_DAY_RESETS_AT"
-      else
-        update_usage_cache "$CUR_LABEL" "__KEEP__" "__KEEP__" "$CUR_STATUS" "live" "__KEEP__" "__KEEP__"
-      fi
+      get_usage_for_label "$CUR_LABEL" 30 >/dev/null
     fi
     refresh_next_usage_cache "$CUR_LABEL"
     exit 0
@@ -2174,6 +2437,22 @@ if [ "$PROXY_ACTIVE" = "yes" ]; then
   exit 0
 fi
 
+# ── Cache-threshold switch ──
+# The usage cache is cross-device synced: if the OTHER device drove the shared
+# account over the threshold, act on that reading even without a fresh local
+# poll (fixes the wake-from-sleep case where the Mac sat on a 100% account).
+if [ "$ENABLED" = "True" ]; then
+  read -r C_STATUS C_UTIL C_RESETS C_AGE <<< $(peek_cached_usage "$CUR_LABEL")
+  if [ "$C_STATUS" = "ok" ] && [ "$C_UTIL" != "none" ] && [ "$C_AGE" -le 300 ] 2>/dev/null && [ "$C_UTIL" -ge "$THRESHOLD" ] 2>/dev/null; then
+    TARGET_INFO=$(find_ordered_switch_target "$CUR_LABEL" "$THRESHOLD")
+    if [ -n "$TARGET_INFO" ]; then
+      IFS='|' read -r TARGET TARGET_UTIL TARGET_RESETS_AT <<< "$TARGET_INFO"
+      perform_switch "$CUR_LABEL" "$C_UTIL" "$C_RESETS" "$TARGET" "$TARGET_UTIL" "$(date +%s)" "cache-threshold"
+      exit 0
+    fi
+  fi
+fi
+
 [ "$(should_poll)" != "yes" ] && exit 0
 
 # Fetch usage for current account
@@ -2193,8 +2472,15 @@ d = json.load(open('$CACHE'))
 u = d.get('usage', {}).get('five_hour', {})
 print(int(u.get('utilization', 0)), u.get('resets_at', '') or 'none')
 " 2>/dev/null || echo "0 none")
-  # Back off so we don't keep hammering the throttled endpoint
-  python3 -c "import json, time; json.dump({'util': $UTIL, 'time': int(time.time()), 'throttled_at': int(time.time())}, open('$LAST_POLL_FILE', 'w'))" 2>/dev/null
+  # Back off exponentially so we don't keep hammering the throttled endpoint
+  python3 -c "
+import json, os, time
+f = '$LAST_POLL_FILE'
+d = json.load(open(f)) if os.path.exists(f) else {}
+count = int(d.get('throttle_count', 0)) + 1
+json.dump({'util': $UTIL, 'time': int(time.time()), 'throttled_at': int(time.time()), 'throttle_count': count}, open(f, 'w'))
+" 2>/dev/null
+  bump_usage_backoff "$CUR_LABEL" >/dev/null
   log "POLL: usage API throttled (429) for $CUR_LABEL — using cache (${UTIL}%), no switch"
 elif [ "$FETCH_STATUS" != "ok" ]; then
   # Transient error (request_failed, unauthorized, http_5xx) — use cache, no backoff
@@ -2216,9 +2502,10 @@ import json, time
 now = int(time.time())
 d = {'account': '$CUR_LABEL', 'usage': {'five_hour': {'utilization': $UTIL, 'resets_at': '$RESETS_AT' if '$RESETS_AT' != 'none' else None}}, 'timestamp': int(time.time() * 1000)}
 json.dump(d, open('$CACHE', 'w'), indent=2)
-json.dump({'util': $UTIL, 'time': now, 'throttled_at': 0}, open('$LAST_POLL_FILE', 'w'))
+json.dump({'util': $UTIL, 'time': now, 'throttled_at': 0, 'throttle_count': 0}, open('$LAST_POLL_FILE', 'w'))
 " 2>/dev/null
   update_usage_cache "$CUR_LABEL" "$UTIL" "$RESETS_AT" "ok" "live" "__KEEP__" "__KEEP__"
+  clear_usage_backoff "$CUR_LABEL"
   save_current_credentials "$CUR_LABEL"
   log "POLL: $CUR_LABEL=${UTIL}%"
 fi
