@@ -947,6 +947,11 @@ cfg = json.load(open(p)) if os.path.exists(p) else {}
 print(json.dumps({'active_account': cfg.get('active_account',''), 'hostname': socket.gethostname()}))
 \"" 2>/dev/null)
     [ -n "$REMOTE_STATUS" ] && echo "$REMOTE_STATUS" > "$HOME/.claude/remote-status.json"
+    # Pull a filtered tail of the remote log so SwiftBar can show Ubuntu activity
+    # offline (no SSH on every menu render). Cheap: one grep|tail over SSH per sync.
+    ssh -o ConnectTimeout=3 "$REMOTE_HOST" \
+      "grep -E 'SWITCH|POLL|throttled|cache-threshold|LIMIT: triggered|SESSION: opened' ~/.claude/auto-switch.log | tail -n 30" \
+      2>/dev/null > "$HOME/.claude/ubuntu-recent-log.txt"
     log "SYNC: usage-only sync with $REMOTE_HOST (sync_credentials=false)"
     python3 -c "import json, time; json.dump({'last_sync': int(time.time())}, open('$TOKEN_SYNC_STATE', 'w'))" 2>/dev/null
     return 0
