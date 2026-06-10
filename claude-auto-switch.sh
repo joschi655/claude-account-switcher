@@ -1577,25 +1577,39 @@ save_current_credentials() {
   # (→ spurious missing_token). mv on the same filesystem is atomic.
   cp "$CLAUDE_JSON" "$JSON_DST.tmp.$$" && mv -f "$JSON_DST.tmp.$$" "$JSON_DST"
   if [ "$OS_TYPE" = "Darwin" ]; then
-    security find-generic-password -l "$KEYCHAIN_SERVICE" -w 2>/dev/null | python3 -c "
-import binascii, sys
+    # CRITICAL: there can be TWO keychain items labeled "Claude Code-credentials"
+    # (Claude's own + an MCP-OAuth item). `-l ... -w` returns whichever it hits
+    # first, which is sometimes the MCP item with NO claudeAiOauth. Writing that
+    # into a backup corrupts it → missing_token → that account silently stops
+    # polling. So: decode, VALIDATE claudeAiOauth.accessToken is present, and
+    # only then atomically promote. Never overwrite a good backup with garbage.
+    local SAVE_RESULT
+    SAVE_RESULT=$(security find-generic-password -l "$KEYCHAIN_SERVICE" -w 2>/dev/null | python3 -c "
+import binascii, json, sys
 raw = sys.stdin.buffer.read().strip()
 payload = raw
-if raw and not raw.startswith(b'{'):
+if raw and not raw.lstrip().startswith(b'{'):
     try:
-        if all(byte in b'0123456789abcdefABCDEF' for byte in raw):
-            decoded = binascii.unhexlify(raw)
-            if decoded.lstrip().startswith(b'{'):
-                payload = decoded
+        if all(b in b'0123456789abcdefABCDEF' for b in raw):
+            dec = binascii.unhexlify(raw)
+            if dec.lstrip().startswith(b'{'):
+                payload = dec
     except Exception:
-        payload = raw
-sys.stdout.buffer.write(payload)
-" > "$KEY_DST.tmp.$$"
-    # Only promote a non-empty payload; never replace a good backup with empty.
-    if [ -s "$KEY_DST.tmp.$$" ]; then
+        pass
+try:
+    if json.loads(payload).get('claudeAiOauth', {}).get('accessToken'):
+        open('$KEY_DST.tmp.$$', 'wb').write(payload)
+        print('ok')
+    else:
+        print('no_claude_token')
+except Exception:
+    print('parse_error')
+")
+    if [ "$SAVE_RESULT" = "ok" ] && [ -s "$KEY_DST.tmp.$$" ]; then
       mv -f "$KEY_DST.tmp.$$" "$KEY_DST"
     else
       rm -f "$KEY_DST.tmp.$$"
+      log "WARN: save $LABEL — live keychain returned $SAVE_RESULT (not a Claude credential); kept existing backup"
     fi
   else
     # Linux: credentials live in ~/.claude/.credentials.json
