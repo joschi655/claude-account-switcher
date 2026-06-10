@@ -1095,6 +1095,55 @@ except Exception:
 " 2>/dev/null || echo "request_failed none none none none"
 }
 
+# Real 5h utilization from the Messages API response headers
+# (anthropic-ratelimit-unified-5h-*). This is a SEPARATE endpoint from
+# /oauth/usage, so it is NOT subject to the aggressive usage-poll throttle that
+# Claude Code's own polling triggers — it returns the true number even when
+# /oauth/usage 429s. Echoes: STATUS UTIL RESETS_AT  (status=ok always when a
+# utilization header is present, regardless of HTTP 200 vs 429; util can exceed
+# 100 when over the cap). Costs one 1-token Messages call.
+fetch_usage_via_messages() {
+  local TOKEN="$1"
+  [ -z "$TOKEN" ] && echo "missing_token none none" && return
+  python3 -c "
+import json, urllib.request, urllib.error
+from datetime import datetime, timezone
+token = '$TOKEN'
+body = json.dumps({'model':'claude-haiku-4-5-20251001','max_tokens':1,'messages':[{'role':'user','content':'hi'}]}).encode()
+req = urllib.request.Request('https://api.anthropic.com/v1/messages', data=body, headers={
+    'Authorization': f'Bearer {token}', 'Content-Type':'application/json',
+    'anthropic-version':'2023-06-01', 'anthropic-beta':'oauth-2025-04-20'})
+
+def parse(headers):
+    h = {k.lower(): v for k, v in headers.items()}
+    util = h.get('anthropic-ratelimit-unified-5h-utilization')
+    reset = h.get('anthropic-ratelimit-unified-5h-reset')
+    if util is None:
+        return None
+    pct = int(round(float(util) * 100)) if float(util) <= 2 else int(float(util))
+    iso = 'none'
+    if reset:
+        try: iso = datetime.fromtimestamp(int(reset), tz=timezone.utc).isoformat()
+        except ValueError: iso = 'none'
+    return f'ok {pct} {iso}'
+
+try:
+    with urllib.request.urlopen(req, timeout=15) as r:
+        out = parse(r.headers)
+        print(out if out else 'missing_window none none')
+except urllib.error.HTTPError as e:
+    out = parse(e.headers)              # 429 still carries the real util header
+    if out:
+        print(out)
+    elif e.code == 401:
+        print('unauthorized none none')
+    else:
+        print(f'http_{e.code} none none')
+except Exception:
+    print('request_failed none none')
+" 2>/dev/null || echo "request_failed none none"
+}
+
 claude_session_active() {
   # Returns true if any conversation JSONL was written in the last 2 minutes.
   # More accurate than pgrep: idle Claude open on the desktop does not count.
@@ -2568,11 +2617,20 @@ CUR_TOKEN=$(get_token "$CUR_LABEL")
 CURRENT_POLL_STATUS="ok"
 read -r FETCH_STATUS UTIL RESETS_AT _SEVEN _SEVEN_AT <<< $(fetch_usage_detailed "$CUR_TOKEN")
 
+# /oauth/usage throttled? Claude Code polls the SAME endpoint during a session
+# and wins the per-account budget, leaving us 429 + a stale cache. Fall back to
+# the Messages-header probe (separate endpoint, not throttled) to get the REAL
+# utilization — this both keeps the display honest and lets the switch fire.
 if [ "$FETCH_STATUS" = "rate_limited" ]; then
-  # HTTP 429 on the usage endpoint = we polled too fast. This is a POLLING rate
-  # limit, NOT the account's 5h cap (the API throttles after ~2 rapid requests).
-  # Use cache, back off, and DO NOT switch — genuine exhaustion shows up as a
-  # high utilization in a 200 response, which the threshold check handles.
+  read -r M_STATUS M_UTIL M_RESETS <<< $(fetch_usage_via_messages "$CUR_TOKEN")
+  if [ "$M_STATUS" = "ok" ] && [ "$M_UTIL" != "none" ]; then
+    FETCH_STATUS="ok"; UTIL="$M_UTIL"; RESETS_AT="$M_RESETS"
+    log "POLL: /oauth/usage throttled — got real util via Messages headers: ${UTIL}%"
+  fi
+fi
+
+if [ "$FETCH_STATUS" = "rate_limited" ]; then
+  # Both endpoints unavailable — use cache, back off, DO NOT switch.
   CURRENT_POLL_STATUS="throttled"
   read -r UTIL RESETS_AT <<< $(python3 -c "
 import json
