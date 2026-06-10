@@ -1625,14 +1625,22 @@ except Exception:
     sys.exit(1)
 " || { log "WARN: refuse to write live creds for $LABEL — backup has no Claude token"; return 1; }
   if [ "$OS_TYPE" = "Darwin" ]; then
+    # Store the credential as RAW JSON. Never hexlify: 'security add ... -w'
+    # stores the string literally, and Claude Code >= 2.1.169 no longer decodes
+    # a hex-text payload — a hexlified write produces "Not logged in" on every
+    # subsequent launch (the root cause of the recurring forced re-logins).
     local KEYCHAIN_DATA
     KEYCHAIN_DATA=$(python3 -c "
 import binascii, sys
 raw = open('$KEYCHAIN_FILE', 'rb').read().strip()
-payload = raw
-if raw.lstrip().startswith(b'{'):
-    payload = binascii.hexlify(raw)
-sys.stdout.write(payload.decode())
+if raw and not raw.lstrip().startswith(b'{'):
+    try:
+        dec = binascii.unhexlify(raw)
+        if dec.lstrip().startswith(b'{'):
+            raw = dec
+    except Exception:
+        pass
+sys.stdout.write(raw.decode())
 ")
     security delete-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" 2>/dev/null || true
     security add-generic-password -U -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" \
@@ -1684,14 +1692,20 @@ json.dump(live, open('$CLAUDE_JSON', 'w'), indent=2)
     cp "$JSON_FILE" "$CLAUDE_JSON"
   fi
   if [ "$OS_TYPE" = "Darwin" ]; then
+    # RAW JSON only — never hexlify ('security add -w' stores literally and
+    # Claude Code >= 2.1.169 won't decode hex text -> "Not logged in").
     local KEYCHAIN_DATA
     KEYCHAIN_DATA=$(python3 -c "
 import binascii, sys
 raw = open('$KEYCHAIN_FILE', 'rb').read().strip()
-payload = raw
-if raw.lstrip().startswith(b'{'):
-    payload = binascii.hexlify(raw)
-sys.stdout.write(payload.decode())
+if raw and not raw.lstrip().startswith(b'{'):
+    try:
+        dec = binascii.unhexlify(raw)
+        if dec.lstrip().startswith(b'{'):
+            raw = dec
+    except Exception:
+        pass
+sys.stdout.write(raw.decode())
 ")
     security delete-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" 2>/dev/null || true
     security add-generic-password -U -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" \
