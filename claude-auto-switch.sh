@@ -1329,20 +1329,24 @@ restart_all_sessions() {
 maybe_run_scheduled_session() {
   SCHEDULED_SESSION_STARTED="no"
   [ "$SESSION_AUTOSTART_ENABLED" != "True" ] && return 0
-  [ ! -x "$CLAUDE_BIN" ] && return 0
-  claude_process_running && return 0
+  # NOTE: no claude_process_running / CLAUDE_BIN guard. Opening a window is a
+  # direct Messages API call (trigger_limit_for_label) that never touches the
+  # live login, so it's safe to fire even while a Claude Code session is active.
+  # The old guards meant scheduled after-reset triggers never fired on a machine
+  # that always has Claude running (e.g. the Ubuntu agent host).
 
-  local NEXT_LABEL NEXT_RESET_AT
-  read -r NEXT_LABEL NEXT_RESET_AT <<< $(python3 -c "
+  # All accounts whose reset time has passed and haven't been opened for that
+  # window yet. Reset times are 10-min-rounded and tend to cluster, so fire them
+  # all in this tick rather than one-per-minute.
+  local DUE_LABELS
+  DUE_LABELS=$(python3 -c "
 import json, os
 from datetime import datetime, timezone
 from dateutil.parser import parse
 
 path = '$SESSION_STATE'
 if not os.path.exists(path):
-    print('', '')
     raise SystemExit(0)
-
 state = json.load(open(path))
 scheduled = state.get('scheduled_resets', {})
 last_windows = state.get('last_window_keys', {})
@@ -1357,22 +1361,21 @@ for label, reset_at in scheduled.items():
     except Exception:
         continue
 due.sort(key=lambda item: item[0])
-if due:
-    _, label, reset_at = due[0]
-    print(label, reset_at)
-else:
-    print('', '')
+for _, label, reset_at in due:
+    print(f'{label}\t{reset_at}')
 " 2>/dev/null)
 
-  [ -z "$NEXT_LABEL" ] && return 0
+  [ -z "$DUE_LABELS" ] && return 0
 
-  if ! credentials_ready "$NEXT_LABEL"; then
-    log "SESSION: skipping scheduled reset autostart for $NEXT_LABEL — credentials missing"
-    return 0
-  fi
-
-  start_background_session "$NEXT_LABEL" "$SESSION_AUTOSTART_THRESHOLD" "$NEXT_RESET_AT" "reset"
-  SCHEDULED_SESSION_STARTED="yes"
+  while IFS=$'\t' read -r NEXT_LABEL NEXT_RESET_AT; do
+    [ -z "$NEXT_LABEL" ] && continue
+    if ! credentials_ready "$NEXT_LABEL"; then
+      log "SESSION: skipping scheduled reset autostart for $NEXT_LABEL — credentials missing"
+      continue
+    fi
+    start_background_session "$NEXT_LABEL" "$SESSION_AUTOSTART_THRESHOLD" "$NEXT_RESET_AT" "reset"
+    SCHEDULED_SESSION_STARTED="yes"
+  done <<< "$DUE_LABELS"
 }
 
 maybe_autostart_session() {
