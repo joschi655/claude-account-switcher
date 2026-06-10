@@ -1498,8 +1498,26 @@ restore_credentials() {
   CUR_LABEL=$(account_label "$(current_account_email)")
   [ "$CUR_LABEL" != "unknown" ] && save_current_credentials "$CUR_LABEL"
 
-  # Restore target
-  cp "$JSON_FILE" "$CLAUDE_JSON"
+  # Restore target — patch ONLY the account identity into the live ~/.claude.json,
+  # never overwrite the whole file. The only account-specific key is oauthAccount;
+  # everything else (mcpServers, projects, skillUsage, onboarding flags) is shared
+  # machine state. Whole-file cp reverted that state to a stale per-account snapshot
+  # on every switch, which looked like MCP servers / config "disappearing".
+  if [ -f "$CLAUDE_JSON" ]; then
+    python3 -c "
+import json
+live = json.load(open('$CLAUDE_JSON'))
+backup = json.load(open('$JSON_FILE'))
+if 'oauthAccount' in backup:
+    live['oauthAccount'] = backup['oauthAccount']
+else:
+    live.pop('oauthAccount', None)
+json.dump(live, open('$CLAUDE_JSON', 'w'), indent=2)
+" 2>/dev/null || cp "$JSON_FILE" "$CLAUDE_JSON"
+  else
+    # No live file yet (fresh machine): seed it from the backup.
+    cp "$JSON_FILE" "$CLAUDE_JSON"
+  fi
   if [ "$OS_TYPE" = "Darwin" ]; then
     local KEYCHAIN_DATA
     KEYCHAIN_DATA=$(python3 -c "
