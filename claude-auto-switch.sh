@@ -2373,8 +2373,12 @@ print(d.get('util', 0), d.get('time', 0), d.get('throttled_at', 0), d.get('throt
   local NOW ELAPSED
   NOW=$(date +%s)
   # 429 backoff: exponential per consecutive throttle (90s, 180s, 360s, 720s, cap 900s).
-  # The first retry stays short so a genuine climb past 90% isn't missed.
-  if [ "${THROTTLED_AT:-0}" -gt 0 ]; then
+  # CRITICAL: only honor the backoff when we're NOT near the limit. Near the
+  # limit (≥75%) the account can climb 75→100% inside one backoff window, and we
+  # have a non-throttled data source (Messages headers) — so we keep polling
+  # every tick regardless of /oauth/usage throttling. The old unconditional
+  # backoff is exactly what made the daemon go blind from 78%→99%.
+  if [ "${THROTTLED_AT:-0}" -gt 0 ] && [ "${LAST_UTIL:-0}" -lt 75 ] 2>/dev/null; then
     local BACKOFF=90
     local C="${THROTTLE_COUNT:-1}"
     [ "$C" -lt 1 ] && C=1
@@ -2662,7 +2666,19 @@ fi
 # Fetch usage for current account
 CUR_TOKEN=$(get_token "$CUR_LABEL")
 CURRENT_POLL_STATUS="ok"
-read -r FETCH_STATUS UTIL RESETS_AT _SEVEN _SEVEN_AT <<< $(fetch_usage_detailed "$CUR_TOKEN")
+
+# Near the limit (cached ≥80%), poll via Messages headers PRIMARILY. /oauth/usage
+# is the endpoint Claude Code also hammers and that throttles — exactly when we
+# most need an accurate reading. The Messages probe isn't subject to that
+# throttle and returns the true 5h utilization, so the switch fires on time.
+read -r _PEEK_STATUS PEEK_UTIL _PEEK_RESET _PEEK_AGE <<< $(peek_cached_usage "$CUR_LABEL")
+if [ "${PEEK_UTIL:-0}" -ge 80 ] 2>/dev/null; then
+  read -r FETCH_STATUS UTIL RESETS_AT <<< $(fetch_usage_via_messages "$CUR_TOKEN")
+  _SEVEN="none"; _SEVEN_AT="none"
+  [ "$FETCH_STATUS" = "ok" ] && log "POLL: near-limit — real util via Messages headers: ${UTIL}%"
+else
+  read -r FETCH_STATUS UTIL RESETS_AT _SEVEN _SEVEN_AT <<< $(fetch_usage_detailed "$CUR_TOKEN")
+fi
 
 # /oauth/usage throttled? Claude Code polls the SAME endpoint during a session
 # and wins the per-account budget, leaving us 429 + a stale cache. Fall back to
