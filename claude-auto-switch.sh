@@ -1725,9 +1725,32 @@ sys.stdout.write(payload.decode())
     # Linux: write directly to credentials file
     cp "$KEYCHAIN_FILE" "$LINUX_CREDENTIALS"
   fi
-  # NOTE: settings.json is intentionally NOT touched here. Account switches only
-  # swap credentials. Proxy/personal settings switching is handled separately by
-  # the SwiftBar use-personal / use-sap-proxy buttons (activate_settings).
+  # MID-SESSION SWITCH TRIGGER: re-serialize settings.json (content + hooks fully
+  # preserved) so Claude Code's config file-watcher fires and the RUNNING session
+  # reloads its credential from the keychain we just swapped — picking up the new
+  # account WITHOUT a manual restart/relogin. This rewrite was historically a
+  # `cp settings-personal.json settings.json`, which is what made mid-session
+  # switching work; it was removed because it wiped hooks. Re-serializing the
+  # file's own content keeps the reload trigger while preserving hooks.
+  touch_settings_for_reload
+}
+
+# Bump settings.json (preserving every key, incl. hooks) to fire Claude Code's
+# file-watcher → in-session credential reload. Atomic write; never drops keys.
+touch_settings_for_reload() {
+  [ ! -f "$SETTINGS" ] && return 0
+  python3 -c "
+import json, os
+p = '$SETTINGS'
+try:
+    d = json.load(open(p))
+except Exception:
+    os.utime(p, None)   # fall back to mtime touch if unparseable
+    raise SystemExit(0)
+tmp = p + '.tmp.$$'
+json.dump(d, open(tmp, 'w'), indent=2)
+os.replace(tmp, p)
+" 2>/dev/null || touch "$SETTINGS"
 }
 
 # ── Kitty terminal helpers ──
