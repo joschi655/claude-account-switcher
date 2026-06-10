@@ -1045,13 +1045,26 @@ get_token_raw() {
   local CURRENT_LABEL
   CURRENT_LABEL=$(account_label "$(current_account_email)")
   python3 -c "
-import json
+import json, binascii, os
 label = '$LABEL'
 current_label = '$CURRENT_LABEL'
 live_file = '$LINUX_CREDENTIALS'
 backup_file = '$(keychain_backup "$LABEL")'
-f = live_file if '$OS_TYPE' == 'Linux' and label == current_label and __import__('os').path.exists(live_file) else backup_file
-print(json.loads(open(f).read().strip()).get('claudeAiOauth', {}).get('accessToken', ''))
+f = live_file if '$OS_TYPE' == 'Linux' and label == current_label and os.path.exists(live_file) else backup_file
+raw = open(f, 'rb').read().strip()
+# Self-heal: a backup written as keychain hex (a known bug in some save paths)
+# is transparently decoded here AND rewritten as JSON so it never bites again.
+if raw and not raw.lstrip().startswith(b'{'):
+    try:
+        if all(c in b'0123456789abcdefABCDEF' for c in raw):
+            dec = binascii.unhexlify(raw)
+            if dec.lstrip().startswith(b'{'):
+                raw = dec
+                if f == backup_file:
+                    open(f, 'w').write(dec.decode())
+    except Exception:
+        pass
+print(json.loads(raw).get('claudeAiOauth', {}).get('accessToken', ''))
 " 2>/dev/null
 }
 
