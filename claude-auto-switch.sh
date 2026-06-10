@@ -1569,7 +1569,13 @@ credentials_ready() {
 save_current_credentials() {
   local LABEL="$1"
   local REASON="${2:-save}"
-  cp "$CLAUDE_JSON" "$(claude_json_backup "$LABEL")"
+  local JSON_DST KEY_DST
+  JSON_DST=$(claude_json_backup "$LABEL")
+  KEY_DST=$(keychain_backup "$LABEL")
+  # Write via temp + atomic rename. A timer tick can overlap a manual run; a
+  # non-atomic 'truncate then write' lets a concurrent reader see an empty file
+  # (→ spurious missing_token). mv on the same filesystem is atomic.
+  cp "$CLAUDE_JSON" "$JSON_DST.tmp.$$" && mv -f "$JSON_DST.tmp.$$" "$JSON_DST"
   if [ "$OS_TYPE" = "Darwin" ]; then
     security find-generic-password -l "$KEYCHAIN_SERVICE" -w 2>/dev/null | python3 -c "
 import binascii, sys
@@ -1584,10 +1590,16 @@ if raw and not raw.startswith(b'{'):
     except Exception:
         payload = raw
 sys.stdout.buffer.write(payload)
-" > "$(keychain_backup "$LABEL")"
+" > "$KEY_DST.tmp.$$"
+    # Only promote a non-empty payload; never replace a good backup with empty.
+    if [ -s "$KEY_DST.tmp.$$" ]; then
+      mv -f "$KEY_DST.tmp.$$" "$KEY_DST"
+    else
+      rm -f "$KEY_DST.tmp.$$"
+    fi
   else
     # Linux: credentials live in ~/.claude/.credentials.json
-    [ -f "$LINUX_CREDENTIALS" ] && cp "$LINUX_CREDENTIALS" "$(keychain_backup "$LABEL")"
+    [ -f "$LINUX_CREDENTIALS" ] && cp "$LINUX_CREDENTIALS" "$KEY_DST.tmp.$$" && mv -f "$KEY_DST.tmp.$$" "$KEY_DST"
   fi
   write_backup_metadata "$LABEL" "$REASON"
 }
