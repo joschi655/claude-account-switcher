@@ -887,13 +887,9 @@ print(json.load(open(f)).get('last_sync', 0) if os.path.exists(f) else 0)
   # its own refresh chain independently.
   if [ "$SYNC_CREDENTIALS" = "False" ]; then
     local REMOTE_CACHE="/tmp/claude-usage-cache-remote.json"
-    local REMOTE_POLL="/tmp/claude-last-poll-remote.json"
-    # Pull remote usage cache + poll state in parallel
+    # Pull remote usage cache (per-account readings shared across devices)
     scp -o ConnectTimeout=5 \
         "$REMOTE_HOST":"$HOME/.claude/account-usage-cache.json" "$REMOTE_CACHE" \
-        2>/dev/null &
-    scp -o ConnectTimeout=5 \
-        "$REMOTE_HOST":"$HOME/.claude/auto-switch-last-poll.json" "$REMOTE_POLL" \
         2>/dev/null &
     wait
     # Merge usage cache: keep per-account entry with the newer timestamp
@@ -919,34 +915,16 @@ out = dict(local_d) if isinstance(local_d, dict) else {}
 out['accounts'] = merged
 json.dump(out, open(local_f, 'w'), indent=2)
 " 2>/dev/null
-    # Merge poll state: keep the most recent poll time so both devices share one rate-limit budget
-    python3 -c "
-import json, os
-local_f = os.path.expanduser('~/.claude/auto-switch-last-poll.json')
-remote_f = '$REMOTE_POLL'
-if not os.path.exists(remote_f):
-    exit()
-local_d = json.load(open(local_f)) if os.path.exists(local_f) else {}
-remote_d = json.load(open(remote_f))
-# Take the more recent poll time
-lt = local_d.get('time', 0)
-rt = remote_d.get('time', 0)
-if rt > lt:
-    # Remote polled more recently — adopt its timestamp so we wait out the remainder
-    merged = dict(local_d)
-    merged['time'] = rt
-    # Propagate throttle backoff from remote if more recent
-    if remote_d.get('throttled_at', 0) > local_d.get('throttled_at', 0):
-        merged['throttled_at'] = remote_d['throttled_at']
-    json.dump(merged, open(local_f, 'w'), indent=2)
-" 2>/dev/null
-    # Push merged files back to remote
+    # NOTE: the per-device poll TIMER (auto-switch-last-poll.json) is intentionally
+    # NOT merged. The usage rate limit is per-account, so adopting the other
+    # device's poll timestamp only suppressed this device's own polling of its
+    # OWN active account (it would go minutes without a POLL because the remote
+    # "had polled"). Each device now keeps its own cadence; the shared per-account
+    # usage CACHE above already gives each device the other's readings for free.
+    # Push merged usage cache back to remote
     scp -o ConnectTimeout=5 "$HOME/.claude/account-usage-cache.json" \
-        "$REMOTE_HOST":"$HOME/.claude/account-usage-cache.json" 2>/dev/null &
-    scp -o ConnectTimeout=5 "$HOME/.claude/auto-switch-last-poll.json" \
-        "$REMOTE_HOST":"$HOME/.claude/auto-switch-last-poll.json" 2>/dev/null &
-    wait
-    rm -f "$REMOTE_CACHE" "$REMOTE_POLL"
+        "$REMOTE_HOST":"$HOME/.claude/account-usage-cache.json" 2>/dev/null
+    rm -f "$REMOTE_CACHE"
     # Fetch remote's active account + hostname for status display (SwiftBar remote section)
     local REMOTE_STATUS
     REMOTE_STATUS=$(ssh -o ConnectTimeout=3 "$REMOTE_HOST" "python3 -c \"
