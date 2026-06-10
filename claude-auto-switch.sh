@@ -1187,6 +1187,7 @@ except Exception as ex:
     # If the unified headers expose 5h utilization/reset, feed the usage cache.
     python3 -c "
 import time
+from datetime import datetime, timezone
 headers = dict(p.split('=', 1) for p in '$HEADERS_PART'.split(';') if '=' in p)
 util = None
 reset = ''
@@ -1194,8 +1195,10 @@ for k, v in headers.items():
     if 'utilization' in k and '5h' in k:
         try: util = int(float(v) * 100) if float(v) <= 1 else int(float(v))
         except ValueError: pass
-    if k.endswith('-reset') and '5h' in k:
-        reset = v
+    if k.endswith('5h-reset'):
+        # Header carries epoch seconds; the cache stores ISO 8601
+        try: reset = datetime.fromtimestamp(int(v), tz=timezone.utc).isoformat()
+        except ValueError: reset = ''
 if util is not None:
     print(f'{util}|{reset}')
 " 2>/dev/null | while IFS='|' read -r H_UTIL H_RESET; do
