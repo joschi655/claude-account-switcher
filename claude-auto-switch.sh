@@ -1629,6 +1629,14 @@ write_live_credentials_from_backup() {
   local KEYCHAIN_FILE
   KEYCHAIN_FILE=$(keychain_backup "$LABEL")
   [ ! -f "$KEYCHAIN_FILE" ] && return 1
+  # Never push a non-Claude / corrupted backup into the live store.
+  python3 -c "
+import json, sys
+try:
+    sys.exit(0 if json.load(open('$KEYCHAIN_FILE')).get('claudeAiOauth', {}).get('accessToken') else 1)
+except Exception:
+    sys.exit(1)
+" || { log "WARN: refuse to write live creds for $LABEL — backup has no Claude token"; return 1; }
   if [ "$OS_TYPE" = "Darwin" ]; then
     local KEYCHAIN_DATA
     KEYCHAIN_DATA=$(python3 -c "
