@@ -44,6 +44,8 @@ SETTINGS_PERSONAL="$HOME/.claude/settings-personal.json"
 
 LOG_DEDUP_FILE="$HOME/.claude/auto-switch-last-log.txt"
 LAST_POLL_FILE="$HOME/.claude/auto-switch-last-poll.json"
+TOKEN_SYNC_STATE="$HOME/.claude/token-sync-state.json"
+TOKEN_SYNC_INTERVAL=120  # sync usage cache cross-machine every 2 minutes
 
 # ── Logging ──
 log() {
@@ -110,6 +112,9 @@ EOF
   SESSION_AUTOSTART_OUTPUT_FORMAT=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('session_autostart_output_format', 'json'))" 2>/dev/null)
   PREFERRED_RETURN_THRESHOLD=$(python3 -c "import json; print(int(json.load(open('$CONFIG')).get('preferred_return_threshold', 70)))" 2>/dev/null)
   LAST_SWITCH_TIME=$(python3 -c "import json; print(int(json.load(open('$CONFIG')).get('last_switch_time', 0)))" 2>/dev/null)
+  REMOTE_HOST=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('remote_host', ''))" 2>/dev/null)
+  REFRESH_BACKUP_TOKENS=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('refresh_backup_tokens', True))" 2>/dev/null)
+  SYNC_CREDENTIALS=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('sync_credentials', True))" 2>/dev/null)
 }
 
 update_config() {
@@ -157,23 +162,15 @@ if '$UTIL' != '__KEEP__':
     entry['utilization'] = int(float('$UTIL'))
   except Exception:
     entry['utilization'] = None
-elif '$STATUS' != 'ok':
-  entry['utilization'] = None
 if '$RESETS_AT' != '__KEEP__':
   entry['resets_at'] = '' if '$RESETS_AT' == 'none' else '$RESETS_AT'
-elif '$STATUS' != 'ok':
-  entry['resets_at'] = ''
 if '$SEVEN_DAY_UTIL' != '__KEEP__':
   try:
     entry['seven_day_utilization'] = int(float('$SEVEN_DAY_UTIL'))
   except Exception:
     entry['seven_day_utilization'] = None
-elif '$STATUS' != 'ok':
-  entry['seven_day_utilization'] = None
 if '$SEVEN_DAY_RESETS_AT' != '__KEEP__':
   entry['seven_day_resets_at'] = '' if '$SEVEN_DAY_RESETS_AT' == 'none' else '$SEVEN_DAY_RESETS_AT'
-elif '$STATUS' != 'ok':
-  entry['seven_day_resets_at'] = ''
 entry['status'] = '$STATUS'
 entry['source'] = '$SOURCE'
 entry['checked_at'] = int(time.time() * 1000)
@@ -323,6 +320,15 @@ perform_switch() {
   local CURRENT_SESSION_MODEL=""
 
   log "SWITCH: $CURRENT_LABEL → $TARGET ($REASON, current=${CURRENT_UTIL}%, target=${TARGET_UTIL}%)"
+
+  # Record when we switched away from the current account (ping-pong guard)
+  python3 -c "
+import json, os, time
+p = os.path.expanduser('~/.claude/auto-switch-history.json')
+d = json.load(open(p)) if os.path.exists(p) else {}
+d.setdefault('switched_away', {})['$CURRENT_LABEL'] = int(time.time())
+json.dump(d, open(p, 'w'), indent=2)
+" 2>/dev/null
 
   restore_credentials "$TARGET"
   update_config "active_account" "\"$TARGET\""
@@ -551,14 +557,26 @@ except Exception as e:
 " 2>/dev/null
 }
 
-# Refresh all backup tokens that are expiring soon
+# Refresh all backup tokens that are expiring soon.
+# Only runs if refresh_backup_tokens is True (default).
+# Set to False on secondary machines that receive tokens via cross-machine sync.
 refresh_all_tokens() {
+  if [ "$REFRESH_BACKUP_TOKENS" = "False" ]; then
+    return 0
+  fi
   local CURRENT_LABEL
   CURRENT_LABEL=$(account_label "$(current_account_email)")
+  local CLAUDE_RUNNING="no"
+  claude_process_running && CLAUDE_RUNNING="yes"
   for f in "$HOME"/.claude-keychain-*.json; do
     [ ! -f "$f" ] && continue
     local LABEL
     LABEL=$(echo "$f" | sed "s|.*\.claude-keychain-\(.*\)\.json|\1|")
+    # Never rotate the active account's token while Claude Code owns it (would
+    # consume the live refresh token and force a re-login on the next launch).
+    if [ "$LABEL" = "$CURRENT_LABEL" ] && [ "$CLAUDE_RUNNING" = "yes" ]; then
+      continue
+    fi
     local RESULT
     RESULT=$(refresh_backup_token "$LABEL" 2>&1)
     if [ -n "$RESULT" ]; then
@@ -583,8 +601,207 @@ refresh_all_tokens() {
       case "$RESULT" in
         REFRESHED*|SKIP_REFRESH*) write_backup_metadata "$LABEL" "refresh" ;;
       esac
+      # If token was rotated, immediately push to remote to prevent the other machine
+      # from trying to use the now-dead old token.
+      case "$RESULT" in
+        *rotated=yes*)
+          if [ -n "$REMOTE_HOST" ]; then
+            scp -o ConnectTimeout=5 "$HOME/.claude-keychain-$LABEL.json" "$REMOTE_HOST":~/.claude-keychain-"$LABEL".json 2>/dev/null && \
+            { [ ! -f "$HOME/.claude.json.$LABEL" ] || scp -o ConnectTimeout=5 "$HOME/.claude.json.$LABEL" "$REMOTE_HOST":~/.claude.json."$LABEL" 2>/dev/null; } && \
+            { [ ! -f "$HOME/.claude-meta-$LABEL.json" ] || scp -o ConnectTimeout=5 "$HOME/.claude-meta-$LABEL.json" "$REMOTE_HOST":~/.claude-meta-"$LABEL".json 2>/dev/null; } && \
+            log "SYNC: pushed rotated token bundle for $LABEL to $REMOTE_HOST"
+          fi
+          ;;
+      esac
     fi
   done
+}
+
+# ── Cross-machine token sync ──
+# Compares local and remote backup token freshness (by expiresAt).
+# Pulls fresher tokens from remote, pushes fresher local tokens to remote.
+# Skips the currently active account (don't overwrite live credentials).
+# Rate-limited to run every TOKEN_SYNC_INTERVAL seconds.
+sync_tokens_cross_machine() {
+  [ -z "$REMOTE_HOST" ] && return 0
+
+  # Rate limit: only sync every TOKEN_SYNC_INTERVAL seconds
+  local LAST_SYNC NOW ELAPSED
+  NOW=$(date +%s)
+  LAST_SYNC=$(python3 -c "
+import json, os
+f = '$TOKEN_SYNC_STATE'
+print(json.load(open(f)).get('last_sync', 0) if os.path.exists(f) else 0)
+" 2>/dev/null || echo "0")
+  ELAPSED=$((NOW - LAST_SYNC))
+  [ "$ELAPSED" -lt "$TOKEN_SYNC_INTERVAL" ] && return 0
+
+  # Check SSH connectivity (fast timeout)
+  if ! ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" true 2>/dev/null; then
+    log "SYNC: remote $REMOTE_HOST unreachable — skipping"
+    # Still update timestamp to avoid retrying every second
+    python3 -c "import json, time; json.dump({'last_sync': int(time.time())}, open('$TOKEN_SYNC_STATE', 'w'))" 2>/dev/null
+    return 0
+  fi
+
+  # Independent mode: only sync the usage cache, not credential files.
+  # This avoids OAuth token-rotation race conditions when each device manages
+  # its own refresh chain independently.
+  if [ "$SYNC_CREDENTIALS" = "False" ]; then
+    local REMOTE_CACHE="/tmp/claude-usage-cache-remote.json"
+    local REMOTE_POLL="/tmp/claude-last-poll-remote.json"
+    # Pull remote usage cache + poll state in parallel
+    scp -o ConnectTimeout=5 \
+        "$REMOTE_HOST":"$HOME/.claude/account-usage-cache.json" "$REMOTE_CACHE" \
+        2>/dev/null &
+    scp -o ConnectTimeout=5 \
+        "$REMOTE_HOST":"$HOME/.claude/auto-switch-last-poll.json" "$REMOTE_POLL" \
+        2>/dev/null &
+    wait
+    # Merge usage cache: keep per-account entry with the newer timestamp
+    python3 -c "
+import json, os
+local_f = os.path.expanduser('~/.claude/account-usage-cache.json')
+remote_f = '$REMOTE_CACHE'
+if not os.path.exists(remote_f):
+    exit()
+local_d = json.load(open(local_f)) if os.path.exists(local_f) else {'accounts': {}}
+remote_d = json.load(open(remote_f))
+local_accts = local_d.get('accounts', {}) if isinstance(local_d, dict) else {}
+remote_accts = remote_d.get('accounts', {}) if isinstance(remote_d, dict) else {}
+merged = dict(local_accts)
+for k, rv in remote_accts.items():
+    rt = rv.get('timestamp', 0)
+    lt = local_accts.get(k, {}).get('timestamp', 0)
+    if rt > lt:
+        merged[k] = rv
+out = dict(local_d) if isinstance(local_d, dict) else {}
+out['accounts'] = merged
+json.dump(out, open(local_f, 'w'), indent=2)
+" 2>/dev/null
+    # Merge poll state: keep the most recent poll time so both devices share one rate-limit budget
+    python3 -c "
+import json, os
+local_f = os.path.expanduser('~/.claude/auto-switch-last-poll.json')
+remote_f = '$REMOTE_POLL'
+if not os.path.exists(remote_f):
+    exit()
+local_d = json.load(open(local_f)) if os.path.exists(local_f) else {}
+remote_d = json.load(open(remote_f))
+# Take the more recent poll time
+lt = local_d.get('time', 0)
+rt = remote_d.get('time', 0)
+if rt > lt:
+    # Remote polled more recently — adopt its timestamp so we wait out the remainder
+    merged = dict(local_d)
+    merged['time'] = rt
+    # Propagate throttle backoff from remote if more recent
+    if remote_d.get('throttled_at', 0) > local_d.get('throttled_at', 0):
+        merged['throttled_at'] = remote_d['throttled_at']
+    json.dump(merged, open(local_f, 'w'), indent=2)
+" 2>/dev/null
+    # Push merged files back to remote
+    scp -o ConnectTimeout=5 "$HOME/.claude/account-usage-cache.json" \
+        "$REMOTE_HOST":"$HOME/.claude/account-usage-cache.json" 2>/dev/null &
+    scp -o ConnectTimeout=5 "$HOME/.claude/auto-switch-last-poll.json" \
+        "$REMOTE_HOST":"$HOME/.claude/auto-switch-last-poll.json" 2>/dev/null &
+    wait
+    rm -f "$REMOTE_CACHE" "$REMOTE_POLL"
+    # Fetch remote's active account + hostname for status display (SwiftBar remote section)
+    local REMOTE_STATUS
+    REMOTE_STATUS=$(ssh -o ConnectTimeout=3 "$REMOTE_HOST" "python3 -c \"
+import json, os, socket
+p = os.path.expanduser('~/.claude/auto-switch-config.json')
+cfg = json.load(open(p)) if os.path.exists(p) else {}
+print(json.dumps({'active_account': cfg.get('active_account',''), 'hostname': socket.gethostname()}))
+\"" 2>/dev/null)
+    [ -n "$REMOTE_STATUS" ] && echo "$REMOTE_STATUS" > "$HOME/.claude/remote-status.json"
+    log "SYNC: usage-only sync with $REMOTE_HOST (sync_credentials=false)"
+    python3 -c "import json, time; json.dump({'last_sync': int(time.time())}, open('$TOKEN_SYNC_STATE', 'w'))" 2>/dev/null
+    return 0
+  fi
+
+  # Single Python script: gather local data, SSH for remote, compare, output actions
+  local ACTIONS_FILE="/tmp/claude-token-sync-actions.txt"
+  local CURRENT_LABEL
+  CURRENT_LABEL=$(account_label "$(current_account_email)")
+
+  # Gather remote expiresAt via SSH
+  local REMOTE_FILE="/tmp/claude-token-sync-remote.json"
+  ssh -o ConnectTimeout=5 "$REMOTE_HOST" "python3 -c \"
+import json, glob, os
+result = {}
+for f in glob.glob(os.path.expanduser('~/.claude-keychain-*.json')):
+    label = f.split('.claude-keychain-')[1].replace('.json', '')
+    try:
+        cred = json.load(open(f))
+        result[label] = cred.get('claudeAiOauth', {}).get('expiresAt', 0)
+    except: pass
+print(json.dumps(result))
+\"" 2>/dev/null > "$REMOTE_FILE"
+
+  [ ! -s "$REMOTE_FILE" ] && return 0
+
+  # Compare local vs remote and write action list
+  python3 -c "
+import json, glob, os
+
+remote = json.load(open('$REMOTE_FILE'))
+current_label = '$CURRENT_LABEL'
+actions = []
+
+local_data = {}
+for f in glob.glob(os.path.expanduser('~/.claude-keychain-*.json')):
+    label = f.split('.claude-keychain-')[1].replace('.json', '')
+    try:
+        cred = json.load(open(f))
+        local_data[label] = cred.get('claudeAiOauth', {}).get('expiresAt', 0)
+    except:
+        pass
+
+all_labels = set(list(local_data.keys()) + list(remote.keys()))
+for label in sorted(all_labels):
+    l_exp = local_data.get(label, 0)
+    r_exp = remote.get(label, 0)
+    if r_exp > l_exp and r_exp > 0:
+        actions.append(f'PULL {label}')
+    elif l_exp > r_exp and l_exp > 0:
+        actions.append(f'PUSH {label}')
+
+with open('$ACTIONS_FILE', 'w') as f:
+    f.write('\n'.join(actions))
+" 2>/dev/null
+
+  [ ! -s "$ACTIONS_FILE" ] && {
+    python3 -c "import json, time; json.dump({'last_sync': int(time.time())}, open('$TOKEN_SYNC_STATE', 'w'))" 2>/dev/null
+    rm -f "$REMOTE_FILE" "$ACTIONS_FILE"
+    return 0
+  }
+
+  while IFS=' ' read -r ACTION LABEL; do
+    [ -z "$ACTION" ] || [ -z "$LABEL" ] && continue
+    # Skip the currently active account — don't overwrite live credentials
+    if [ "$LABEL" = "$CURRENT_LABEL" ]; then
+      log "SYNC: skipping $LABEL (currently active)"
+      continue
+    fi
+    if [ "$ACTION" = "PULL" ]; then
+      scp -o ConnectTimeout=5 "$REMOTE_HOST":~/.claude-keychain-"$LABEL".json "$HOME/.claude-keychain-$LABEL.json" 2>/dev/null && \
+      scp -o ConnectTimeout=5 "$REMOTE_HOST":~/.claude.json."$LABEL" "$HOME/.claude.json.$LABEL" 2>/dev/null && \
+      scp -o ConnectTimeout=5 "$REMOTE_HOST":~/.claude-meta-"$LABEL".json "$HOME/.claude-meta-$LABEL.json" 2>/dev/null
+      log "SYNC: pulled fresher token for $LABEL from $REMOTE_HOST"
+    elif [ "$ACTION" = "PUSH" ]; then
+      scp -o ConnectTimeout=5 "$HOME/.claude-keychain-$LABEL.json" "$REMOTE_HOST":~/.claude-keychain-"$LABEL".json 2>/dev/null && \
+      scp -o ConnectTimeout=5 "$HOME/.claude.json.$LABEL" "$REMOTE_HOST":~/.claude.json."$LABEL" 2>/dev/null && \
+      scp -o ConnectTimeout=5 "$HOME/.claude-meta-$LABEL.json" "$REMOTE_HOST":~/.claude-meta-"$LABEL".json 2>/dev/null
+      log "SYNC: pushed fresher token for $LABEL to $REMOTE_HOST"
+    fi
+  done < "$ACTIONS_FILE"
+
+  rm -f "$REMOTE_FILE" "$ACTIONS_FILE"
+
+  # Update last sync time
+  python3 -c "import json, time; json.dump({'last_sync': int(time.time())}, open('$TOKEN_SYNC_STATE', 'w'))" 2>/dev/null
 }
 
 get_token_raw() {
@@ -642,6 +859,25 @@ except Exception:
 " 2>/dev/null || echo "request_failed none none none none"
 }
 
+claude_session_active() {
+  # Returns true if any conversation JSONL was written in the last 2 minutes.
+  # More accurate than pgrep: idle Claude open on the desktop does not count.
+  python3 -c "
+import os, time, sys
+cutoff = time.time() - 120
+projects = os.path.expanduser('~/.claude/projects')
+for root, dirs, files in os.walk(projects):
+    for f in files:
+        if f.endswith('.jsonl'):
+            try:
+                if os.path.getmtime(os.path.join(root, f)) > cutoff:
+                    sys.exit(0)
+            except OSError:
+                pass
+sys.exit(1)
+" 2>/dev/null
+}
+
 claude_process_running() {
   pgrep -f '(^|/)claude($| )' >/dev/null 2>&1
 }
@@ -668,8 +904,9 @@ schedule_session_after_reset() {
   local LABEL="$1"
   local UTIL="$2"
   local RESETS_AT="$3"
+  local FORCE="${4:-no}"
 
-  [ "$SESSION_AUTOSTART_ENABLED" != "True" ] && return 0
+  [ "$SESSION_AUTOSTART_ENABLED" != "True" ] && [ "$FORCE" != "yes" ] && return 0
   [ "$RESETS_AT" = "none" ] && return 0
   [ "$UTIL" -lt "$SESSION_AUTOSTART_THRESHOLD" ] 2>/dev/null && return 0
 
@@ -697,15 +934,8 @@ start_background_session() {
   local RESETS_AT="$3"
   local REASON="$4"
 
-  local RUN_LOG
-  RUN_LOG="$HOME/.claude/session-autostart-$(date +%s).log"
-  nohup "$CLAUDE_BIN" -p "$SESSION_AUTOSTART_PROMPT" \
-    --model "$SESSION_AUTOSTART_MODEL" \
-    --allowedTools "$SESSION_AUTOSTART_ALLOWED_TOOLS" \
-    --max-turns "$SESSION_AUTOSTART_MAX_TURNS" \
-    --output-format "$SESSION_AUTOSTART_OUTPUT_FORMAT" \
-    > "$RUN_LOG" 2>&1 &
-
+  # Open the 5h window via direct API (no keychain swap, no active-session disruption)
+  trigger_limit_for_label "$LABEL"
   mark_session_autostart "$LABEL" "$(date +%F)" "$RESETS_AT"
   python3 -c "
 import json, os
@@ -717,8 +947,8 @@ scheduled = state.setdefault('scheduled_resets', {})
 scheduled.pop('$LABEL', None)
 json.dump(state, open(path, 'w'), indent=2)
 " 2>/dev/null
-  mark_session_started "$LABEL" "$RESETS_AT" "$REASON" "$RUN_LOG"
-  log "SESSION: started cheap claude run for $LABEL ($REASON, util=${UTIL}%, log=$RUN_LOG)"
+  mark_session_started "$LABEL" "$RESETS_AT" "$REASON" ""
+  log "SESSION: opened 5h window for $LABEL ($REASON, util=${UTIL}%)"
 }
 
 run_sync_session_for_label() {
@@ -726,17 +956,74 @@ run_sync_session_for_label() {
   local UTIL="$2"
   local RESETS_AT="$3"
   local REASON="$4"
-  local RUN_LOG
-  RUN_LOG="$HOME/.claude/session-autostart-${LABEL//[^A-Za-z0-9._-]/_}-$(date +%s).log"
-  "$CLAUDE_BIN" -p "$SESSION_AUTOSTART_PROMPT" \
-    --model "$SESSION_AUTOSTART_MODEL" \
-    --allowedTools "$SESSION_AUTOSTART_ALLOWED_TOOLS" \
-    --max-turns "$SESSION_AUTOSTART_MAX_TURNS" \
-    --output-format "$SESSION_AUTOSTART_OUTPUT_FORMAT" \
-    > "$RUN_LOG" 2>&1
+  # Open the 5h window via direct API (no keychain swap, no active-session disruption)
+  trigger_limit_for_label "$LABEL"
   mark_session_autostart "$LABEL" "$(date +%F)" "$RESETS_AT"
-  mark_session_started "$LABEL" "$RESETS_AT" "$REASON" "$RUN_LOG"
-  log "SESSION: completed sync claude run for $LABEL ($REASON, util=${UTIL}%, log=$RUN_LOG)"
+  mark_session_started "$LABEL" "$RESETS_AT" "$REASON" ""
+  log "SESSION: opened 5h window for $LABEL ($REASON, util=${UTIL}%)"
+}
+
+# Trigger the 5h usage limit window for a label via a direct Messages API call.
+# Uses the account's backup OAuth token — does NOT swap the live keychain or run
+# the claude CLI, so it never disrupts the currently active Claude Code session.
+trigger_limit_for_label() {
+  local LABEL="$1"
+  if ! credentials_ready "$LABEL"; then
+    log "LIMIT: trigger skip $LABEL — credentials not ready"
+    return 1
+  fi
+  # Ensure token is fresh before the API call
+  local REFRESH_RESULT
+  REFRESH_RESULT=$(refresh_backup_token "$LABEL" 2>/dev/null)
+  log "LIMIT: refresh before trigger $LABEL: $REFRESH_RESULT"
+
+  local TOKEN
+  TOKEN=$(get_token_raw "$LABEL")
+  if [ -z "$TOKEN" ]; then
+    log "LIMIT: trigger FAILED for $LABEL — no token available"
+    return 1
+  fi
+
+  # Minimal Messages API request: opens a fresh 5h window for this account.
+  local RESULT
+  RESULT=$(python3 -c "
+import urllib.request, urllib.error, json
+body = json.dumps({
+  'model': 'claude-haiku-4-5-20251001',
+  'max_tokens': 1,
+  'messages': [{'role': 'user', 'content': 'hi'}]
+}).encode()
+req = urllib.request.Request(
+  'https://api.anthropic.com/v1/messages',
+  data=body,
+  headers={
+    'Authorization': 'Bearer $TOKEN',
+    'Content-Type': 'application/json',
+    'anthropic-version': '2023-06-01',
+    'anthropic-beta': 'oauth-2025-04-20'
+  }
+)
+try:
+  with urllib.request.urlopen(req, timeout=15) as r:
+    json.loads(r.read())
+    print('ok')
+except urllib.error.HTTPError as e:
+  # 429 = already rate-limited (window is open, that's fine). Others = real error.
+  if e.code == 429:
+    print('ok')
+  else:
+    print(f'http_{e.code}')
+except Exception as ex:
+  print(f'error_{type(ex).__name__}')
+" 2>/dev/null)
+
+  if [ "$RESULT" = "ok" ]; then
+    log "LIMIT: triggered 5h window for $LABEL (direct API)"
+    return 0
+  else
+    log "LIMIT: trigger FAILED for $LABEL — $RESULT"
+    return 1
+  fi
 }
 
 refresh_next_usage_cache() {
@@ -806,12 +1093,67 @@ start_all_sessions() {
       SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       continue
     fi
-    restore_credentials "$LABEL"
-    update_config "active_account" "\"$LABEL\""
     run_sync_session_for_label "$LABEL" "$UTIL" "$RESETS_AT" "start-all"
     STARTED_COUNT=$((STARTED_COUNT + 1))
   done < <(all_account_labels)
   log "SESSION: start-all finished — started=$STARTED_COUNT skipped=$SKIPPED_COUNT"
+}
+
+restart_all_sessions() {
+  # Open 5h usage windows for all accounts via direct Messages API calls using
+  # each account's backup token. Never swaps the live keychain, so the active
+  # Claude Code session is never disrupted. Accounts still over threshold are
+  # scheduled to open after their reset.
+  local TRIGGERED_COUNT=0
+  local SCHEDULED_COUNT=0
+  local SKIPPED_COUNT=0
+
+  while IFS= read -r LABEL; do
+    [ -z "$LABEL" ] && continue
+    if ! credentials_ready "$LABEL"; then
+      log "LIMIT: restart-all skip $LABEL — credentials missing"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue
+    fi
+    local TOKEN STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT
+    TOKEN=$(get_token "$LABEL")
+    read -r STATUS UTIL RESETS_AT SEVEN_DAY_UTIL SEVEN_DAY_RESETS_AT <<< $(fetch_usage_detailed "$TOKEN")
+    if [ "$STATUS" != "ok" ]; then
+      update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "$STATUS" "restart-all" "__KEEP__" "__KEEP__"
+      log "LIMIT: restart-all skip $LABEL — usage status $STATUS"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue
+    fi
+    update_usage_cache "$LABEL" "$UTIL" "$RESETS_AT" "ok" "restart-all" "$SEVEN_DAY_UTIL" "$SEVEN_DAY_RESETS_AT"
+
+    if [ "$UTIL" -lt "$SESSION_AUTOSTART_THRESHOLD" ] 2>/dev/null; then
+      # Limit has reset or is low — trigger NOW
+      if [ "$(session_window_started "$LABEL" "$RESETS_AT")" = "yes" ] && [ "$RESETS_AT" != "none" ]; then
+        log "LIMIT: restart-all skip $LABEL — already triggered for window $RESETS_AT"
+        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+        continue
+      fi
+      if trigger_limit_for_label "$LABEL"; then
+        mark_session_autostart "$LABEL" "$(date +%F)" "$RESETS_AT"
+        mark_session_started "$LABEL" "$RESETS_AT" "restart-all" ""
+        TRIGGERED_COUNT=$((TRIGGERED_COUNT + 1))
+      else
+        log "LIMIT: restart-all trigger failed for $LABEL"
+        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      fi
+    elif [ "$RESETS_AT" != "none" ]; then
+      # Limit still active — schedule for after reset
+      schedule_session_after_reset "$LABEL" "$UTIL" "$RESETS_AT" "yes"
+      log "LIMIT: restart-all scheduled $LABEL for after reset at $RESETS_AT (util=${UTIL}%)"
+      SCHEDULED_COUNT=$((SCHEDULED_COUNT + 1))
+    else
+      log "LIMIT: restart-all skip $LABEL — no reset window, util=${UTIL}%"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+    fi
+  done < <(all_account_labels)
+
+  log "LIMIT: restart-all finished — triggered=$TRIGGERED_COUNT scheduled=$SCHEDULED_COUNT skipped=$SKIPPED_COUNT"
+  echo "triggered=$TRIGGERED_COUNT scheduled=$SCHEDULED_COUNT skipped=$SKIPPED_COUNT"
 }
 
 maybe_run_scheduled_session() {
@@ -859,8 +1201,6 @@ else:
     return 0
   fi
 
-  restore_credentials "$NEXT_LABEL"
-  update_config "active_account" "\"$NEXT_LABEL\""
   start_background_session "$NEXT_LABEL" "$SESSION_AUTOSTART_THRESHOLD" "$NEXT_RESET_AT" "reset"
   SCHEDULED_SESSION_STARTED="yes"
 }
@@ -944,6 +1284,15 @@ restore_credentials() {
   JSON_FILE=$(claude_json_backup "$LABEL")
   KEYCHAIN_FILE=$(keychain_backup "$LABEL")
 
+  [ -f "$JSON_FILE" ] || {
+    log "RESTORE: missing claude.json backup for $LABEL"
+    return 1
+  }
+  [ -f "$KEYCHAIN_FILE" ] || {
+    log "RESTORE: missing keychain backup for $LABEL"
+    return 1
+  }
+
   # Save current account first
   local CUR_LABEL
   CUR_LABEL=$(account_label "$(current_account_email)")
@@ -961,14 +1310,19 @@ if raw.lstrip().startswith(b'{'):
     payload = binascii.hexlify(raw)
 sys.stdout.write(payload.decode())
 ")
-    security delete-generic-password -l "$KEYCHAIN_SERVICE" 2>/dev/null
-    security add-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" \
-      -l "$KEYCHAIN_SERVICE" -w "$KEYCHAIN_DATA" 2>/dev/null
+    security delete-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" 2>/dev/null || true
+    security add-generic-password -U -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" \
+      -l "$KEYCHAIN_SERVICE" -w "$KEYCHAIN_DATA" >/dev/null 2>&1 || {
+        log "RESTORE: failed to update macOS keychain for $LABEL"
+        return 1
+      }
   else
     # Linux: write directly to credentials file
     cp "$KEYCHAIN_FILE" "$LINUX_CREDENTIALS"
   fi
-  [ -f "$SETTINGS_PERSONAL" ] && cp "$SETTINGS_PERSONAL" "$SETTINGS"
+  # NOTE: settings.json is intentionally NOT touched here. Account switches only
+  # swap credentials. Proxy/personal settings switching is handled separately by
+  # the SwiftBar use-personal / use-sap-proxy buttons (activate_settings).
 }
 
 # ── Kitty terminal helpers ──
@@ -1117,6 +1471,60 @@ resolve_continue_socket() {
       name,
     ]))
   " 2>/dev/null
+  }
+
+  # List live Claude Code sessions on local AND remote host (if configured).
+  # Output: host\tpid\tsession_id\tcwd\tmodel\tstarted_at\tname
+  list_live_sessions() {
+    # Local sessions
+    local PID SESSION_ID CWD MODEL STARTED_AT NAME
+    while IFS=$'\t' read -r PID SESSION_ID CWD MODEL STARTED_AT NAME; do
+      [ -z "$SESSION_ID" ] && continue
+      echo -e "local\t$PID\t$SESSION_ID\t$CWD\t$MODEL\t$STARTED_AT\t$NAME"
+    done < <(list_active_claude_sessions)
+
+    # Remote sessions (if REMOTE_HOST is configured)
+    [ -z "$REMOTE_HOST" ] && return 0
+    ssh -o ConnectTimeout=5 "$REMOTE_HOST" 'python3 -c "
+import glob, json, os
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+def last_model(sid):
+    root = os.path.expanduser(\"~/.claude/projects\")
+    for dp, _, fns in os.walk(root):
+        if f\"{sid}.jsonl\" in fns:
+            model = \"\"
+            with open(os.path.join(dp, f\"{sid}.jsonl\")) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    try:
+                        rec = json.loads(line)
+                    except: continue
+                    msg = rec.get(\"message\") or {}
+                    if isinstance(msg, dict):
+                        v = msg.get(\"model\", \"\")
+                        if v: model = v
+            return model
+    return \"\"
+
+for path in sorted(glob.glob(os.path.expanduser(\"~/.claude/sessions/*.json\")), key=os.path.getmtime, reverse=True):
+    try: s = json.load(open(path))
+    except: continue
+    pid = int(s.get(\"pid\", 0) or 0)
+    sid = s.get(\"sessionId\", \"\")
+    cwd = s.get(\"cwd\", \"\")
+    started = str(s.get(\"startedAt\", \"\"))
+    name = s.get(\"name\", \"\")
+    if not pid or not sid or not alive(pid): continue
+    print(f\"remote\t{pid}\t{sid}\t{cwd}\t{last_model(sid)}\t{started}\t{name}\")
+"' 2>/dev/null || true
   }
 
   resolve_active_session_for_cwd() {
@@ -1553,28 +1961,37 @@ schedule_resume() {
   [ -n "$RESUME_TIME" ] && echo "$RESUME_TIME" > "$HOME/.claude/auto-switch-resume-time.txt"
 }
 
-# ── Adaptive polling: reduce API calls when utilization is low ──
+# ── Adaptive polling: 60s when Claude Code is running, 300s otherwise ──
 should_poll() {
-  local LAST_UTIL LAST_POLL_TIME
-  if claude_process_running; then
-    echo "yes"
-    return
-  fi
+  local LAST_UTIL LAST_POLL_TIME THROTTLED_AT
   if [ -f "$LAST_POLL_FILE" ]; then
-    read -r LAST_UTIL LAST_POLL_TIME <<< $(python3 -c "
+    read -r LAST_UTIL LAST_POLL_TIME THROTTLED_AT <<< $(python3 -c "
 import json
 d = json.load(open('$LAST_POLL_FILE'))
-print(d.get('util', 0), d.get('time', 0))
-" 2>/dev/null || echo "0 0")
+print(d.get('util', 0), d.get('time', 0), d.get('throttled_at', 0))
+" 2>/dev/null || echo "0 0 0")
   else
     echo "yes"; return
   fi
-  local NOW ELAPSED INTERVAL
+  local NOW ELAPSED
   NOW=$(date +%s)
+  # 429 backoff: wait ~90s for the usage-API throttle to clear, then retry to get
+  # a real reading. Short enough that we won't miss a genuine climb past 90%.
+  if [ "${THROTTLED_AT:-0}" -gt 0 ]; then
+    ELAPSED=$((NOW - THROTTLED_AT))
+    [ "$ELAPSED" -lt 90 ] && echo "no" && return
+  fi
   ELAPSED=$((NOW - LAST_POLL_TIME))
-  if   [ "$LAST_UTIL" -lt 10 ]; then INTERVAL=900   # <10%:   every 15 min
-  elif [ "$LAST_UTIL" -lt 50 ]; then INTERVAL=300   # 10-49%: every 5 min
-  else                                INTERVAL=60    # ≥50%:   every minute
+  local INTERVAL
+  # The usage API throttles after ~2 rapid requests per account, so 60s (the
+  # launchd tick floor) is the fastest safe rate. Poll every tick when near the
+  # limit to catch the 90% crossing; back off when low to avoid needless calls.
+  if [ "${LAST_UTIL:-0}" -ge 70 ] 2>/dev/null; then
+    INTERVAL=60    # Near the limit: poll every tick to catch the 90% crossing
+  elif claude_session_active; then
+    INTERVAL=120   # Conversation active (JSONL written in last 2 min): every 2 minutes
+  else
+    INTERVAL=300   # Idle or no active session: every 5 minutes
   fi
   [ "$ELAPSED" -ge "$INTERVAL" ] && echo "yes" || echo "no"
 }
@@ -1584,9 +2001,13 @@ get_token() {
   local LABEL="$1"
   local CURRENT_LABEL
   CURRENT_LABEL=$(account_label "$(current_account_email)")
-  if ! { [ "$OS_TYPE" = "Linux" ] && [ "$LABEL" = "$CURRENT_LABEL" ] && [ -f "$LINUX_CREDENTIALS" ]; }; then
-    refresh_backup_token "$LABEL" >/dev/null 2>&1 || true
-  fi
+  # Never rotate the ACTIVE account's token while a Claude Code process owns it —
+  # rotation consumes the refresh token in the live keychain and forces a re-login.
+  # The active account's backup mirrors the live (valid) token via save_current_credentials.
+  local SKIP_REFRESH="no"
+  [ "$LABEL" = "$CURRENT_LABEL" ] && claude_process_running && SKIP_REFRESH="yes"
+  [ "$OS_TYPE" = "Linux" ] && [ "$LABEL" = "$CURRENT_LABEL" ] && [ -f "$LINUX_CREDENTIALS" ] && SKIP_REFRESH="yes"
+  [ "$SKIP_REFRESH" = "no" ] && { refresh_backup_token "$LABEL" >/dev/null 2>&1 || true; }
   get_token_raw "$LABEL"
 }
 
@@ -1594,7 +2015,7 @@ fetch_usage() {
   local TOKEN="$1"
   [ -z "$TOKEN" ] && echo "-1 none" && return
   python3 -c "
-import urllib.request, json
+import urllib.request, urllib.error, json
 req = urllib.request.Request(
   'https://api.anthropic.com/api/oauth/usage',
   headers={
@@ -1615,6 +2036,11 @@ try:
         print('-1 none')
       else:
         print(int(util), u.get('resets_at', '') or 'none')
+except urllib.error.HTTPError as e:
+  if e.code == 429:
+    print('-2 none')
+  else:
+    print('-1 none')
 except:
   print('-1 none')
 " 2>/dev/null || echo "-1 none"
@@ -1624,12 +2050,47 @@ except:
 read_config
 
 case "$1" in
+  save)
+    CUR_EMAIL=$(current_account_email)
+    CUR_LABEL=${2:-$(account_label "$CUR_EMAIL")}
+    if [ -z "$CUR_LABEL" ] || [ "$CUR_LABEL" = "unknown" ]; then
+      log "SAVE: could not determine current account label"
+      exit 1
+    fi
+    save_current_credentials "$CUR_LABEL" "manual-save"
+    exit $?
+    ;;
+  restore)
+    if [ -z "$2" ]; then
+      log "RESTORE: missing label"
+      exit 1
+    fi
+    restore_credentials "$2"
+    if [ $? -eq 0 ]; then
+      update_config "active_account" "\"$2\""
+      exit 0
+    fi
+    exit 1
+    ;;
+  trigger-limit)
+    if [ -z "$2" ]; then
+      echo "Usage: $0 trigger-limit <label>"
+      exit 1
+    fi
+    # Direct API ping — opens the target's 5h window without touching the live login
+    trigger_limit_for_label "$2"
+    exit $?
+    ;;
   register-auto-continue)
     register_auto_continue "$2" "$3" "$4" "$5" "$6"
     exit $?
     ;;
   list-active-sessions)
     list_active_claude_sessions
+    exit 0
+    ;;
+  list-live-sessions)
+    list_live_sessions
     exit 0
     ;;
   list-auto-continue)
@@ -1670,6 +2131,13 @@ case "$1" in
     start_all_sessions
     exit 0
     ;;
+  restart-all-sessions)
+    CUR_EMAIL=$(current_account_email)
+    CUR_LABEL=$(account_label "$CUR_EMAIL")
+    [ "$CUR_LABEL" != "unknown" ] && save_current_credentials "$CUR_LABEL"
+    restart_all_sessions
+    exit 0
+    ;;
 esac
 
 # Keep the active account's backup in sync with the real live credential before
@@ -1681,28 +2149,66 @@ CUR_LABEL=$(account_label "$CUR_EMAIL")
 
 # Keep backup tokens fresh on every timer run, independent of auto-switch state.
 refresh_all_tokens
+sync_tokens_cross_machine
 maybe_run_scheduled_session
 [ "$SCHEDULED_SESSION_STARTED" = "yes" ] && exit 0
 maybe_run_auto_continue_sessions
 
 [ "$ENABLED" != "True" ] && [ "$SESSION_AUTOSTART_ENABLED" != "True" ] && exit 0
+
+# Proxy guard: if Claude Code is routed through a proxy (SAP AI Core / HAI),
+# the claude.ai usage API is irrelevant and we must NOT switch claude.ai accounts.
+# Detect via a non-default ANTHROPIC_BASE_URL in the live settings.json.
+PROXY_ACTIVE=$(python3 -c "
+import json, os
+p = os.path.expanduser('~/.claude/settings.json')
+try:
+    env = json.load(open(p)).get('env', {})
+except Exception:
+    env = {}
+base = env.get('ANTHROPIC_BASE_URL', '')
+print('yes' if base and 'api.anthropic.com' not in base else 'no')
+" 2>/dev/null || echo "no")
+if [ "$PROXY_ACTIVE" = "yes" ]; then
+  log "SKIP: proxy active (ANTHROPIC_BASE_URL set) — no claude.ai polling or switching"
+  exit 0
+fi
+
 [ "$(should_poll)" != "yes" ] && exit 0
 
 # Fetch usage for current account
 CUR_TOKEN=$(get_token "$CUR_LABEL")
 CURRENT_POLL_STATUS="ok"
-read -r UTIL RESETS_AT <<< $(fetch_usage "$CUR_TOKEN")
+read -r FETCH_STATUS UTIL RESETS_AT _SEVEN _SEVEN_AT <<< $(fetch_usage_detailed "$CUR_TOKEN")
 
-if [ "$UTIL" -eq -1 ] 2>/dev/null; then
-  CURRENT_POLL_STATUS="api_error"
-  # API failed — use cached value, skip poll timer update
-  log "POLL: API error for $CUR_LABEL — using cache"
+if [ "$FETCH_STATUS" = "rate_limited" ]; then
+  # HTTP 429 on the usage endpoint = we polled too fast. This is a POLLING rate
+  # limit, NOT the account's 5h cap (the API throttles after ~2 rapid requests).
+  # Use cache, back off, and DO NOT switch — genuine exhaustion shows up as a
+  # high utilization in a 200 response, which the threshold check handles.
+  CURRENT_POLL_STATUS="throttled"
   read -r UTIL RESETS_AT <<< $(python3 -c "
 import json
 d = json.load(open('$CACHE'))
 u = d.get('usage', {}).get('five_hour', {})
 print(int(u.get('utilization', 0)), u.get('resets_at', '') or 'none')
 " 2>/dev/null || echo "0 none")
+  # Back off so we don't keep hammering the throttled endpoint
+  python3 -c "import json, time; json.dump({'util': $UTIL, 'time': int(time.time()), 'throttled_at': int(time.time())}, open('$LAST_POLL_FILE', 'w'))" 2>/dev/null
+  log "POLL: usage API throttled (429) for $CUR_LABEL — using cache (${UTIL}%), no switch"
+elif [ "$FETCH_STATUS" != "ok" ]; then
+  # Transient error (request_failed, unauthorized, http_5xx) — use cache, no backoff
+  CURRENT_POLL_STATUS="api_error"
+  log "POLL: API error ($FETCH_STATUS) for $CUR_LABEL — using cache"
+  read -r UTIL RESETS_AT <<< $(python3 -c "
+import json
+d = json.load(open('$CACHE'))
+u = d.get('usage', {}).get('five_hour', {})
+print(int(u.get('utilization', 0)), u.get('resets_at', '') or 'none')
+" 2>/dev/null || echo "0 none")
+  # Don't touch the usage cache on transient errors — preserve last known values.
+  # Update poll timer so retries happen on the normal interval (no throttled_at backoff).
+  python3 -c "import json, time; json.dump({'util': $UTIL, 'time': int(time.time()), 'throttled_at': 0}, open('$LAST_POLL_FILE', 'w'))" 2>/dev/null
 else
   # Success — update cache + poll timer + refresh active account backup.
   python3 -c "
@@ -1710,43 +2216,37 @@ import json, time
 now = int(time.time())
 d = {'account': '$CUR_LABEL', 'usage': {'five_hour': {'utilization': $UTIL, 'resets_at': '$RESETS_AT' if '$RESETS_AT' != 'none' else None}}, 'timestamp': int(time.time() * 1000)}
 json.dump(d, open('$CACHE', 'w'), indent=2)
-json.dump({'util': $UTIL, 'time': now}, open('$LAST_POLL_FILE', 'w'))
+json.dump({'util': $UTIL, 'time': now, 'throttled_at': 0}, open('$LAST_POLL_FILE', 'w'))
 " 2>/dev/null
   update_usage_cache "$CUR_LABEL" "$UTIL" "$RESETS_AT" "ok" "live" "__KEEP__" "__KEEP__"
   save_current_credentials "$CUR_LABEL"
+  log "POLL: $CUR_LABEL=${UTIL}%"
 fi
 
-[ "$UTIL" -eq -1 ] 2>/dev/null && update_usage_cache "$CUR_LABEL" "__KEEP__" "__KEEP__" "api_error" "live" "__KEEP__" "__KEEP__"
+# Throttled by the usage API — don't add more load or switch. Back off and wait.
+[ "$CURRENT_POLL_STATUS" = "throttled" ] && exit 0
+
 refresh_next_usage_cache "$CUR_LABEL"
 
 maybe_autostart_session "$CUR_LABEL" "$UTIL" "$RESETS_AT"
 schedule_session_after_reset "$CUR_LABEL" "$UTIL" "$RESETS_AT"
 
-log "POLL: $CUR_LABEL=${UTIL}%"
+# Transient API errors: skip switch logic, backoff already set above
+[ "$CURRENT_POLL_STATUS" = "api_error" ] && exit 0
 
 [ "$ENABLED" != "True" ] && exit 0
 
-# Cooldown: no switch within 5 minutes of the last switch
 NOW=$(date +%s)
 ELAPSED=$((NOW - LAST_SWITCH_TIME))
-[ "$ELAPSED" -lt 300 ] && exit 0
-
-PREFERRED_TARGET=$(preferred_return_label "$CUR_LABEL" "$UTIL" "$PREFERRED_RETURN_THRESHOLD")
-if [ -n "$PREFERRED_TARGET" ] && [ "$PREFERRED_TARGET" != "$CUR_LABEL" ]; then
-  PREFERRED_TOKEN=$(get_token "$PREFERRED_TARGET")
-  read -r PREFERRED_STATUS PREFERRED_UTIL PREFERRED_RESETS_AT PREFERRED_SEVEN_DAY_UTIL PREFERRED_SEVEN_DAY_RESETS_AT <<< $(fetch_usage_detailed "$PREFERRED_TOKEN")
-  if [ "$PREFERRED_STATUS" = "ok" ]; then
-    update_usage_cache "$PREFERRED_TARGET" "$PREFERRED_UTIL" "$PREFERRED_RESETS_AT" "ok" "priority-return" "$PREFERRED_SEVEN_DAY_UTIL" "$PREFERRED_SEVEN_DAY_RESETS_AT"
-    if [ "$PREFERRED_UTIL" -lt "$PREFERRED_RETURN_THRESHOLD" ] 2>/dev/null; then
-      perform_switch "$CUR_LABEL" "$UTIL" "$RESETS_AT" "$PREFERRED_TARGET" "$PREFERRED_UTIL" "$NOW" "priority-return"
-      exit 0
-    fi
-  else
-    update_usage_cache "$PREFERRED_TARGET" "__KEEP__" "__KEEP__" "$PREFERRED_STATUS" "priority-return" "__KEEP__" "__KEEP__"
-  fi
-fi
 
 if [ "$CURRENT_POLL_STATUS" != "ok" ]; then
+  # Cooldown: don't switch on api-error if we switched for the same reason recently.
+  # This prevents ping-pong between accounts when all accounts get transient errors.
+  if [ "$ELAPSED" -lt 180 ]; then
+    log "SKIP: api-error switch cooldown (${ELAPSED}s since last switch) — current=$CUR_LABEL"
+    exit 0
+  fi
+
   TARGET_INFO=$(find_ordered_switch_target "$CUR_LABEL" "$THRESHOLD")
   if [ -z "$TARGET_INFO" ]; then
     pause_all_sessions_for_full_capacity "$CUR_LABEL" "$RESETS_AT"
