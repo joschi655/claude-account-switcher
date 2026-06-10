@@ -319,6 +319,34 @@ if os.path.exists(path):
 " 2>/dev/null
 }
 
+# Mark/clear "this account's token chain was donated to the remote — log in again
+# locally to get a fresh independent chain". Surfaced by SwiftBar as a reminder so
+# a donate is never silently forgotten.
+set_needs_local_relogin() {
+  local LABEL="$1"
+  python3 -c "
+import json, os, time
+path = '$USAGE_CACHE'
+state = json.load(open(path)) if os.path.exists(path) else {'accounts': {}}
+entry = state.setdefault('accounts', {}).setdefault('$LABEL', {'label': '$LABEL'})
+entry['needs_local_relogin'] = int(time.time())
+json.dump(state, open(path, 'w'), indent=2)
+" 2>/dev/null
+}
+
+clear_needs_local_relogin() {
+  local LABEL="$1"
+  python3 -c "
+import json, os
+path = '$USAGE_CACHE'
+if os.path.exists(path):
+    state = json.load(open(path))
+    entry = state.get('accounts', {}).get('$LABEL')
+    if entry and entry.pop('needs_local_relogin', None) is not None:
+        json.dump(state, open(path, 'w'), indent=2)
+" 2>/dev/null
+}
+
 next_usage_refresh_label() {
   local CURRENT_LABEL="$1"
   python3 -c "
@@ -2292,9 +2320,10 @@ case "$1" in
     fi
     save_current_credentials "$CUR_LABEL" "manual-save"
     SAVE_RC=$?
-    # A fresh login replaces the refresh chain — clear dead/backoff state
+    # A fresh login replaces the refresh chain — clear dead/backoff/relogin state
     clear_refresh_dead "$CUR_LABEL"
     clear_usage_backoff "$CUR_LABEL"
+    clear_needs_local_relogin "$CUR_LABEL"
     exit $SAVE_RC
     ;;
   restore)
@@ -2364,6 +2393,7 @@ if os.path.exists(p):
       # The donated refresh chain now belongs to the remote — stop rotating it
       # locally until a fresh local login replaces it (the save subcommand clears this).
       set_refresh_dead_until "$REPAIR_LABEL" 86400
+      set_needs_local_relogin "$REPAIR_LABEL"
       log "REPAIR: donated credential bundle for $REPAIR_LABEL to $REMOTE_HOST — re-login locally for this account when convenient"
       echo "Donated $REPAIR_LABEL to $REMOTE_HOST. Now re-login on THIS machine for $REPAIR_LABEL (then run: $0 save $REPAIR_LABEL)."
       osascript -e "display notification \"$REPAIR_LABEL repaired on remote. Re-login locally, then Save.\" with title \"Claude Auto-Switch\"" 2>/dev/null
