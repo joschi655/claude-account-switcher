@@ -601,7 +601,16 @@ print(resume.astimezone().strftime('%H:%M'))
     log "SKIP-PAUSE: reset too soon (${WAIT_SECONDS}s) — switching without pause"
     osascript -e "display notification \"Auto-Switch: → $TARGET (reset imminent, no pause)\" with title \"Claude Auto-Switch\"" 2>/dev/null
   else
-    if [ "$REASON" = "priority-return" ]; then
+    # A running Claude Code session does NOT pick up the swapped credential — it
+    # holds the old account's token until restarted. So if a session is active
+    # when we switch, the credential is ready but the user must RESTART Claude
+    # Code (or /login) to land on the fresh account. Make that loud + actionable.
+    if claude_session_active || claude_process_running; then
+      osascript -e "display notification \"Switched to $TARGET. RESTART Claude Code (or /login) to continue — the running session is still on the old account.\" with title \"⚠️ Claude Auto-Switch\" sound name \"Glass\"" 2>/dev/null
+      # Best-effort voice nudge via PAI Pulse, if running (non-fatal if absent).
+      curl -sf -m 2 -X POST http://localhost:31337/notify -H "Content-Type: application/json" \
+        -d "{\"message\": \"Account switched to a fresh one. Restart Claude Code to continue.\", \"voice_enabled\": true}" >/dev/null 2>&1 || true
+    elif [ "$REASON" = "priority-return" ]; then
       osascript -e "display notification \"Auto-Switch: back to $TARGET (${TARGET_UTIL}% in priority order)\" with title \"Claude Auto-Switch\"" 2>/dev/null
     else
       osascript -e "display notification \"Auto-Switch: switched to $TARGET (${CURRENT_UTIL}% limit reached)\" with title \"Claude Auto-Switch\"" 2>/dev/null
