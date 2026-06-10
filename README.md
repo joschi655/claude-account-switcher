@@ -160,12 +160,17 @@ chmod +x "/path/to/claude-account-switcher/swiftbar-claude-account-switcher.1m.s
 What it shows:
 
 - a compact menu bar icon and current usage badge,
-- the current account,
-- 5-hour and 7-day usage state,
+- the current account, with 5-hour and 7-day usage state,
+- one-click **switch** to any configured account,
+- per-account **"restart limit"** actions to open a fresh 5-hour window (cheap haiku ping, no chat disruption),
+- a **Recent Activity** view (polls, switches, throttle backoffs) tailed from the log,
+- the configured account order with each account's usage,
 - pending auto-continue jobs,
-- and the configured account order.
+- and, if a `remote_host` is configured, the remote device's active account and login health (with a one-click "repair from here" action).
 
-The plugin also exposes a menu action to refresh the usage cache by calling `claude-auto-switch.sh refresh-usage-cache-all`.
+Menu actions call the switcher directly (`restore`, `save`, `trigger-limit`, `refresh-usage-cache-all`, `start-all-sessions`, `repair-remote`). It reads only the switcher's local state files — it makes no API calls of its own (the daemon is the single poller).
+
+Note: switching the account swaps the live credential, but a Claude Code session that is already running keeps its old token until it reloads. The switcher bumps `settings.json` to trigger that reload; if a running session doesn't pick it up, restart Claude Code (or `/login`) to land on the freshly selected account.
 
 ## Who This Is Great For
 

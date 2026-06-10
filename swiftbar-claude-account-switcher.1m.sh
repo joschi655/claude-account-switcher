@@ -1,4 +1,15 @@
 #!/bin/bash
+#
+# SwiftBar/xbar plugin for claude-auto-switch.
+# Drop this next to claude-auto-switch.sh in your SwiftBar plugins folder
+# (or symlink it). Refreshes every minute (the "1m" in the filename).
+#
+# Shows: active account + 5h/7d usage, one-click switch to any configured
+# account, save credentials, start fresh 5h windows, recent switcher activity,
+# and (if a remote_host is configured) the remote device's status.
+#
+# Reads only the switcher's own state files under ~/.claude — no network calls
+# of its own (the daemon is the single API poller).
 
 SELF_PATH=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$0" 2>/dev/null)
 SCRIPT_DIR=$(dirname "$SELF_PATH")
@@ -14,6 +25,7 @@ fi
 python3 - <<PY
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -28,6 +40,7 @@ usage_cache = os.path.join(home, '.claude', 'account-usage-cache.json')
 config_path = os.path.join(home, '.claude', 'auto-switch-config.json')
 session_state_path = os.path.join(home, '.claude', 'session-autostart-state.json')
 remote_status_path = os.path.join(home, '.claude', 'remote-status.json')
+log_path = os.path.join(home, '.claude', 'auto-switch.log')
 switcher_script = os.path.expanduser("$SWITCHER_SCRIPT")
 
 def load_json(path, default):
@@ -78,8 +91,10 @@ def badge(entry):
         if status:
             return status.replace('_', ' ')
         return '—'
+    # '?' marks a reading taken while the usage API was throttled (rate_limited)
+    suffix = '?' if status == 'rate_limited' else ''
     rem = format_remaining(entry.get('resets_at', ''))
-    return f'{util}% · {rem}' if rem else f'{util}%'
+    return f'{util}%{suffix} · {rem}' if rem else f'{util}%{suffix}'
 
 cache = load_json(usage_cache, {'accounts': {}})
 accounts = cache.get('accounts', {}) if isinstance(cache, dict) else {}
@@ -120,6 +135,18 @@ if seven_day is not None:
 if scheduled_count:
     print(f'Auto-continue pending: {scheduled_count}')
 
+# ── Switch account ──
+# Swaps the live credential to the chosen account. NOTE: a running Claude Code
+# session keeps its old token until it reloads — the switcher bumps settings.json
+# to trigger that reload, but if the session doesn't pick it up, restart Claude
+# Code (or /login) to land on the freshly-selected account.
+others = [l for l in configured if l != email]
+if others:
+    print('---')
+    print('Switch to')
+    for label in others:
+        print(f"--{label} — {badge(accounts.get(label, {}))} | bash='/bin/bash' param1={switcher_script!r} param2=restore param3={label!r} terminal=false refresh=true")
+
 print('---')
 print(f"Refresh usage cache | bash='/bin/bash' param1={switcher_script!r} param2=refresh-usage-cache-all terminal=false refresh=true")
 print(f"Save credentials: {email} | bash='/bin/bash' param1={switcher_script!r} param2=save terminal=false refresh=true")
@@ -129,17 +156,40 @@ print(f"Save credentials: {email} | bash='/bin/bash' param1={switcher_script!r} 
 # This is not a Claude Code session restart — it does not touch any active
 # chat. It simply opens a fresh 5-hour window for the account.
 print('---')
-print('5h Session | color=#7f8c8d')
+print('5h Session')
 for label in configured:
     print(f"--Restart limit: {label} | bash='/bin/bash' param1={switcher_script!r} param2=trigger-limit param3={label!r} terminal=false refresh=true")
 print(f"--Restart all limits | bash='/bin/bash' param1={switcher_script!r} param2=start-all-sessions terminal=false refresh=true")
 
 if configured:
     print('---')
-    print('Configured order | color=#7f8c8d')
+    print('Configured order')
     for idx, label in enumerate(configured, start=1):
         account_entry = accounts.get(label, {})
         print(f'--{idx}. {label} — {badge(account_entry)}')
+
+# ── Recent Activity ──
+# Tail of the switcher log: polls, switches, throttle backoffs, opened windows.
+def tail_activity(path, n=12):
+    keep = re.compile(r'SWITCH|POLL|throttl|cache-threshold|LIMIT: triggered|SESSION: opened')
+    try:
+        lines = [l for l in open(path, errors='replace').read().splitlines() if keep.search(l)]
+    except Exception:
+        return []
+    out = []
+    for line in lines[-n:]:
+        t = line[11:19] if len(line) > 19 and line[10] == ' ' else ''
+        msg = (line[20:] if t else line).replace('|', '/')
+        msg = re.sub(r'@[\w.]+', '', msg).replace(' (direct API)', '').replace('usage API ', '')
+        out.append(f'{t}  {msg}' if t else msg)
+    return list(reversed(out))   # newest first
+
+activity = tail_activity(log_path)
+if activity:
+    print('---')
+    print('Recent Activity')
+    for line in activity:
+        print(f'--{line} | size=12')
 
 # ── Remote device status ──
 remote_active = remote_status.get('active_account', '')
@@ -148,12 +198,13 @@ if remote_active:
     remote_entry = accounts.get(remote_active, {})
     remote_badge = badge(remote_entry)
     remote_status_val = remote_entry.get('status', '')
-    # Flag login errors with a warning color
     error_color = ' | color=#e74c3c' if remote_status_val in ('unauthorized', 'missing_credentials', 'request_failed') else ''
     print('---')
-    print(f'Remote ({remote_host}) | color=#7f8c8d')
+    print(f'Remote ({remote_host})')
     print(f'--Active: {remote_active}{error_color}')
     print(f'--Usage: {remote_badge}{error_color}')
     if remote_status_val in ('unauthorized', 'missing_credentials'):
         print(f'--⚠ Login required on {remote_host} | color=#e74c3c')
+        # One-click repair: donate this machine's working credential bundle.
+        print(f"--🔧 Repair from here (push token) | bash='/bin/bash' param1={switcher_script!r} param2=repair-remote param3={remote_active!r} terminal=false refresh=true")
 PY
