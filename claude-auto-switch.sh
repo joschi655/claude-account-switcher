@@ -1351,9 +1351,14 @@ refresh_next_usage_cache() {
   local NEXT_LABEL
   NEXT_LABEL=$(next_usage_refresh_label "$CURRENT_LABEL")
   [ -z "$NEXT_LABEL" ] && return 0
-  # Cache-first round-robin: skips the API entirely when the other device
-  # already refreshed this account in the last 10 minutes.
-  get_usage_for_label "$NEXT_LABEL" 600 >/dev/null
+  # Cache-first round-robin for the NON-active accounts. While a Claude Code
+  # session is running it competes for the per-account /oauth/usage budget — and
+  # the session may be burning one of these very accounts — so a round-robin poll
+  # just 429s and spams "backing off" with no benefit. During a session, serve
+  # cache with a long tolerance (no competing API call); otherwise 10 min.
+  local TOL=600
+  claude_process_running && TOL=3600
+  get_usage_for_label "$NEXT_LABEL" "$TOL" >/dev/null
 }
 
 refresh_all_usage_cache() {
