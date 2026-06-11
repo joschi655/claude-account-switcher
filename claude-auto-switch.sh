@@ -1346,6 +1346,42 @@ if util is not None:
   fi
 }
 
+# Echoes "dead" if the LIVE credential is unrecoverable — expired access token
+# AND no refresh token — so neither Claude Code nor we can renew it (=> 401).
+live_credential_dead() {
+  python3 -c "
+import json, os, subprocess, binascii, time
+def load():
+    if '$OS_TYPE' == 'Linux':
+        p = os.path.expanduser('$LINUX_CREDENTIALS')
+        return json.load(open(p)) if os.path.exists(p) else {}
+    raw = subprocess.check_output(['security','find-generic-password','-l','$KEYCHAIN_SERVICE','-w'], stderr=subprocess.DEVNULL).strip()
+    if raw and not raw.lstrip().startswith(b'{'):
+        try: raw = binascii.unhexlify(raw)
+        except Exception: pass
+    return json.loads(raw)
+try:
+    o = load().get('claudeAiOauth', {})
+    expired = (o.get('expiresAt', 0) - time.time()*1000) < 0
+    no_refresh = not o.get('refreshToken')
+    print('dead' if (expired and no_refresh) else 'ok')
+except Exception:
+    print('unknown')
+" 2>/dev/null || echo "unknown"
+}
+
+# A backup that can renew itself: has a refresh token (expiry may have lapsed —
+# the refresh chain brings it back).
+backup_is_recoverable() {
+  python3 -c "
+import json
+try:
+    print('yes' if json.load(open('$(keychain_backup "$1")')).get('claudeAiOauth', {}).get('refreshToken') else 'no')
+except Exception:
+    print('no')
+" 2>/dev/null || echo "no"
+}
+
 refresh_next_usage_cache() {
   local CURRENT_LABEL="$1"
   local NEXT_LABEL
@@ -2646,6 +2682,38 @@ esac
 CUR_EMAIL=$(current_account_email)
 CUR_LABEL=$(account_label "$CUR_EMAIL")
 [ "$CUR_LABEL" != "unknown" ] && save_current_credentials "$CUR_LABEL"
+
+# Dead-active-account auto-recovery: if the LIVE credential is unrecoverable
+# (expired + no refresh token => guaranteed 401), don't sit on it. Restore the
+# active account from a recoverable backup if we have one; otherwise switch to
+# the first healthy account in configured order. Runs even while Claude is
+# active — on Linux the running session re-reads the credentials file and
+# recovers; on macOS the next launch does. Prevents the recurring "Please run
+# /login" where the daemon happily polls a 401'd active account forever.
+if [ "$CUR_LABEL" != "unknown" ] && [ "$(live_credential_dead)" = "dead" ]; then
+  if [ "$(backup_is_recoverable "$CUR_LABEL")" = "yes" ]; then
+    log "RECOVER: live token for $CUR_LABEL is dead — restoring from recoverable backup"
+    restore_credentials "$CUR_LABEL"
+  else
+    RECOVER_TARGET=""
+    while IFS= read -r CAND; do
+      [ -z "$CAND" ] || [ "$CAND" = "$CUR_LABEL" ] && continue
+      if credentials_ready "$CAND" && [ "$(backup_is_recoverable "$CAND")" = "yes" ]; then
+        RECOVER_TARGET="$CAND"; break
+      fi
+    done < <(all_account_labels)
+    if [ -n "$RECOVER_TARGET" ]; then
+      log "RECOVER: live token for $CUR_LABEL is dead and unrecoverable — switching to healthy $RECOVER_TARGET"
+      restore_credentials "$RECOVER_TARGET"
+      update_config "active_account" "\"$RECOVER_TARGET\""
+      CUR_LABEL="$RECOVER_TARGET"
+      CUR_EMAIL=$(current_account_email)
+      osascript -e "display notification \"Active account credential was dead — switched to $RECOVER_TARGET. Restart Claude Code to continue.\" with title \"⚠️ Claude Auto-Switch\" sound name \"Glass\"" 2>/dev/null || true
+    else
+      log "RECOVER: live token for $CUR_LABEL is dead and NO recoverable account exists — re-login required"
+    fi
+  fi
+fi
 
 # Auto-clear any stale "re-login needed" reminder once a fresh local login is detected.
 detect_local_relogin
