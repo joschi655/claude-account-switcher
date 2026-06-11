@@ -761,7 +761,10 @@ try:
     cred['claudeAiOauth']['refreshToken'] = result['refresh_token']
     cred['claudeAiOauth']['expiresAt'] = now_ms + result['expires_in'] * 1000
     open(KEYCHAIN_FILE, 'w').write(json.dumps(cred))
-    print(f'REFRESHED hours_left={hours_left:.1f} new_hours={result["expires_in"]/3600:.1f} rotated={rotated} refresh_hash={refresh_hash}')
+    # NOTE: no double quotes inside this python3 -c block — the shell strips
+    # them (result[expires_in] -> NameError on every successful refresh).
+    new_hours = result['expires_in'] / 3600
+    print(f'REFRESHED hours_left={hours_left:.1f} new_hours={new_hours:.1f} rotated={rotated} refresh_hash={refresh_hash}')
 except urllib.error.HTTPError as e:
     body = e.read().decode('utf-8', 'replace')[:300]
     try:
