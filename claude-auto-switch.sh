@@ -174,7 +174,9 @@ if '$SEVEN_DAY_RESETS_AT' != '__KEEP__':
 entry['status'] = '$STATUS'
 entry['source'] = '$SOURCE'
 entry['checked_at'] = int(time.time() * 1000)
-json.dump(state, open(path, 'w'), indent=2)
+tmp = path + '.tmp'
+json.dump(state, open(tmp, 'w'), indent=2)
+os.replace(tmp, path)
 " 2>/dev/null
 }
 
@@ -191,7 +193,9 @@ entry = state.setdefault('accounts', {}).setdefault('$LABEL', {'label': '$LABEL'
 step = min(max(int(entry.get('backoff_s', 0)) * 2, 90), 900)
 entry['backoff_s'] = step
 entry['backoff_until'] = int(time.time()) + step
-json.dump(state, open(path, 'w'), indent=2)
+tmp = path + '.tmp'
+json.dump(state, open(tmp, 'w'), indent=2)
+os.replace(tmp, path)
 print(step)
 " 2>/dev/null
 }
@@ -205,7 +209,9 @@ state = json.load(open(path)) if os.path.exists(path) else {'accounts': {}}
 entry = state.setdefault('accounts', {}).setdefault('$LABEL', {'label': '$LABEL'})
 entry.pop('backoff_s', None)
 entry.pop('backoff_until', None)
-json.dump(state, open(path, 'w'), indent=2)
+tmp = path + '.tmp'
+json.dump(state, open(tmp, 'w'), indent=2)
+os.replace(tmp, path)
 " 2>/dev/null
 }
 
@@ -255,6 +261,7 @@ else:
     update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "rate_limited" "fetch" "__KEEP__" "__KEEP__"
     local STEP
     STEP=$(bump_usage_backoff "$LABEL")
+    STEP="${STEP:-90}"
     log "POLL: 429 for $LABEL — backing off ${STEP}s"
   else
     update_usage_cache "$LABEL" "__KEEP__" "__KEEP__" "$STATUS" "fetch" "__KEEP__" "__KEEP__"
