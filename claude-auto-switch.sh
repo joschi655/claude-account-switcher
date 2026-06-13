@@ -2537,6 +2537,27 @@ except:
 read_config
 
 case "$1" in
+  pause-for-login)
+    # Write a flag file that suppresses RECOVER + account switching for 5 minutes.
+    # Use this before /login to prevent the daemon from immediately switching away.
+    PAUSE_UNTIL=$(( $(date +%s) + 300 ))
+    echo "$PAUSE_UNTIL" > "$HOME/.claude/auto-switch-login-pause.txt"
+    TARGET_LABEL="${2:-}"
+    if [ -n "$TARGET_LABEL" ]; then
+      echo "$TARGET_LABEL" >> "$HOME/.claude/auto-switch-login-pause.txt"
+      log "LOGIN-PAUSE: switching to $TARGET_LABEL and pausing RECOVER for 5 min — run /login then Save credentials"
+      restore_credentials "$TARGET_LABEL" 2>/dev/null || true
+      update_config "active_account" "\"$TARGET_LABEL\""
+    else
+      log "LOGIN-PAUSE: RECOVER + switching paused for 5 min — run /login then Save credentials"
+    fi
+    ;;
+
+  resume-after-login)
+    rm -f "$HOME/.claude/auto-switch-login-pause.txt"
+    log "LOGIN-PAUSE: cleared manually"
+    ;;
+
   save)
     CUR_EMAIL=$(current_account_email)
     CUR_LABEL=${2:-$(account_label "$CUR_EMAIL")}
@@ -2550,6 +2571,8 @@ case "$1" in
     clear_refresh_dead "$CUR_LABEL"
     clear_usage_backoff "$CUR_LABEL"
     clear_needs_local_relogin "$CUR_LABEL"
+    # Clear login-pause flag now that we've saved
+    rm -f "$HOME/.claude/auto-switch-login-pause.txt"
     exit $SAVE_RC
     ;;
   restore)
@@ -2697,7 +2720,23 @@ CUR_LABEL=$(account_label "$CUR_EMAIL")
 # active — on Linux the running session re-reads the credentials file and
 # recovers; on macOS the next launch does. Prevents the recurring "Please run
 # /login" where the daemon happily polls a 401'd active account forever.
-if [ "$CUR_LABEL" != "unknown" ] && [ "$(live_credential_dead)" = "dead" ]; then
+#
+# LOGIN-PAUSE guard: if the user ran pause-for-login (via SwiftBar or CLI) we
+# skip RECOVER for up to 5 minutes so they can /login and save without the
+# daemon immediately switching away.
+LOGIN_PAUSE_FILE="$HOME/.claude/auto-switch-login-pause.txt"
+LOGIN_PAUSED=false
+if [ -f "$LOGIN_PAUSE_FILE" ]; then
+  PAUSE_UNTIL=$(head -1 "$LOGIN_PAUSE_FILE" 2>/dev/null || echo 0)
+  if [ "$(date +%s)" -lt "${PAUSE_UNTIL:-0}" ]; then
+    LOGIN_PAUSED=true
+    log "LOGIN-PAUSE: RECOVER + switching suppressed until $(date -r "${PAUSE_UNTIL}" '+%H:%M' 2>/dev/null || echo '?')"
+  else
+    rm -f "$LOGIN_PAUSE_FILE"
+  fi
+fi
+
+if [ "$LOGIN_PAUSED" = "false" ] && [ "$CUR_LABEL" != "unknown" ] && [ "$(live_credential_dead)" = "dead" ]; then
   if [ "$(backup_is_recoverable "$CUR_LABEL")" = "yes" ]; then
     log "RECOVER: live token for $CUR_LABEL is dead — restoring from recoverable backup"
     restore_credentials "$CUR_LABEL"
@@ -2756,7 +2795,7 @@ fi
 # The usage cache is cross-device synced: if the OTHER device drove the shared
 # account over the threshold, act on that reading even without a fresh local
 # poll (fixes the wake-from-sleep case where the Mac sat on a 100% account).
-if [ "$ENABLED" = "True" ]; then
+if [ "$ENABLED" = "True" ] && [ "$LOGIN_PAUSED" = "false" ]; then
   read -r C_STATUS C_UTIL C_RESETS C_AGE <<< $(peek_cached_usage "$CUR_LABEL")
   if [ "$C_STATUS" = "ok" ] && [ "$C_UTIL" != "none" ] && [ "$C_AGE" -le 300 ] 2>/dev/null && [ "$C_UTIL" -ge "$THRESHOLD" ] 2>/dev/null; then
     TARGET_INFO=$(find_ordered_switch_target "$CUR_LABEL" "$THRESHOLD")
@@ -2858,6 +2897,7 @@ schedule_session_after_reset "$CUR_LABEL" "$UTIL" "$RESETS_AT"
 [ "$CURRENT_POLL_STATUS" = "api_error" ] && exit 0
 
 [ "$ENABLED" != "True" ] && exit 0
+[ "$LOGIN_PAUSED" = "true" ] && exit 0
 
 NOW=$(date +%s)
 ELAPSED=$((NOW - LAST_SWITCH_TIME))
