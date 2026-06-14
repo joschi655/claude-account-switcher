@@ -114,6 +114,7 @@ EOF
   LAST_SWITCH_TIME=$(python3 -c "import json; print(int(json.load(open('$CONFIG')).get('last_switch_time', 0)))" 2>/dev/null)
   REMOTE_HOST=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('remote_host', ''))" 2>/dev/null)
   REFRESH_BACKUP_TOKENS=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('refresh_backup_tokens', True))" 2>/dev/null)
+  CONSECUTIVE_429_THRESHOLD=$(python3 -c "import json; print(int(json.load(open('$CONFIG')).get('consecutive_429_threshold', 10)))" 2>/dev/null || echo 10)
   SYNC_CREDENTIALS=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('sync_credentials', True))" 2>/dev/null)
 }
 
@@ -2839,7 +2840,7 @@ if [ "$FETCH_STATUS" = "rate_limited" ]; then
 fi
 
 if [ "$FETCH_STATUS" = "rate_limited" ]; then
-  # Both endpoints unavailable — use cache, back off, DO NOT switch.
+  # Both endpoints unavailable — use cache, back off, then decide whether to switch.
   CURRENT_POLL_STATUS="throttled"
   read -r UTIL RESETS_AT <<< $(python3 -c "
 import json
@@ -2848,15 +2849,16 @@ u = d.get('usage', {}).get('five_hour', {})
 print(int(u.get('utilization', 0)), u.get('resets_at', '') or 'none')
 " 2>/dev/null || echo "0 none")
   # Back off exponentially so we don't keep hammering the throttled endpoint
-  python3 -c "
+  THROTTLE_COUNT=$(python3 -c "
 import json, os, time
 f = '$LAST_POLL_FILE'
 d = json.load(open(f)) if os.path.exists(f) else {}
 count = int(d.get('throttle_count', 0)) + 1
 json.dump({'util': $UTIL, 'time': int(time.time()), 'throttled_at': int(time.time()), 'throttle_count': count}, open(f, 'w'))
-" 2>/dev/null
+print(count)
+" 2>/dev/null || echo 0)
   bump_usage_backoff "$CUR_LABEL" >/dev/null
-  log "POLL: usage API throttled (429) for $CUR_LABEL — using cache (${UTIL}%), no switch"
+  log "POLL: usage API throttled (429) for $CUR_LABEL — using cache (${UTIL}%), tick ${THROTTLE_COUNT}/${CONSECUTIVE_429_THRESHOLD}"
 elif [ "$FETCH_STATUS" != "ok" ]; then
   # Transient error (request_failed, unauthorized, http_5xx) — use cache, no backoff
   CURRENT_POLL_STATUS="api_error"
@@ -2885,7 +2887,51 @@ json.dump({'util': $UTIL, 'time': now, 'throttled_at': 0, 'throttle_count': 0}, 
   log "POLL: $CUR_LABEL=${UTIL}%"
 fi
 
-# Throttled by the usage API — don't add more load or switch. Back off and wait.
+# Throttled by the usage API — check stale cache and tick count before giving up.
+if [ "$CURRENT_POLL_STATUS" = "throttled" ] && [ "$ENABLED" = "True" ] && [ "$LOGIN_PAUSED" = "false" ]; then
+  # Read last-known utilization from account-usage-cache (separate from stats-cache).
+  read -r STALE_UTIL STALE_AGE_S <<< $(python3 -c "
+import json, os, time
+path = '$USAGE_CACHE'
+try:
+    entry = json.load(open(path)).get('accounts', {}).get('$CUR_LABEL', {})
+except Exception:
+    entry = {}
+util = entry.get('utilization')
+checked_at_ms = entry.get('checked_at', 0)
+age_s = int(time.time() - checked_at_ms / 1000) if checked_at_ms else 999999
+print((str(util) if util is not None else 'none'), age_s)
+" 2>/dev/null || echo "none 999999")
+
+  SWITCH_REASON=""
+  if [ "$STALE_UTIL" != "none" ] && [ "${STALE_AGE_S:-999999}" -le 28800 ] 2>/dev/null && [ "${STALE_UTIL:-0}" -ge "$THRESHOLD" ] 2>/dev/null; then
+    STALE_AGE_H=$(( ${STALE_AGE_S:-0} / 3600 ))
+    SWITCH_REASON="stale-cache-util"
+    log "POLL: stale cache shows ${STALE_UTIL}% >= threshold for $CUR_LABEL (${STALE_AGE_H}h old) — switching"
+  elif [ "${THROTTLE_COUNT:-0}" -ge "${CONSECUTIVE_429_THRESHOLD:-10}" ] 2>/dev/null; then
+    SWITCH_REASON="consecutive-429"
+    log "POLL: 429 for ${THROTTLE_COUNT} consecutive ticks on $CUR_LABEL — assumed exhausted, switching"
+  fi
+
+  if [ -n "$SWITCH_REASON" ]; then
+    TARGET_INFO=$(find_ordered_switch_target "$CUR_LABEL" "$THRESHOLD")
+    if [ -n "$TARGET_INFO" ]; then
+      IFS='|' read -r TARGET TARGET_UTIL TARGET_RESETS_AT <<< "$TARGET_INFO"
+      python3 -c "
+import json, os
+f = '$LAST_POLL_FILE'
+d = json.load(open(f)) if os.path.exists(f) else {}
+d['throttle_count'] = 0
+json.dump(d, open(f, 'w'))
+" 2>/dev/null
+      perform_switch "$CUR_LABEL" "${STALE_UTIL:-0}" "${RESETS_AT:-none}" "$TARGET" "$TARGET_UTIL" "$(date +%s)" "$SWITCH_REASON"
+      exit 0
+    else
+      log "WARN: 429 on $CUR_LABEL, would switch ($SWITCH_REASON) but no healthy target — staying"
+    fi
+  fi
+  exit 0
+fi
 [ "$CURRENT_POLL_STATUS" = "throttled" ] && exit 0
 
 refresh_next_usage_cache "$CUR_LABEL"
