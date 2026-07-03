@@ -2632,16 +2632,54 @@ print(before-len(c['accounts']))
     else
       log "REMOVE: '$LABEL' removed from priority list"
     fi
-    # Remove from usage cache
+    # Remove the label from every state file that tracks it by name, so no ghost
+    # entry survives (usage cache, switch history, refresh audit, autostart state).
     python3 -c "
 import json, os
-p='$USAGE_CACHE'
-if os.path.exists(p):
-    c=json.load(open(p))
-    if isinstance(c.get('accounts'),dict):
-        c['accounts'].pop('$LABEL', None)
-        json.dump(c, open(p,'w'), indent=2)
+home = os.path.expanduser('~')
+label = '$LABEL'
+
+def load(p):
+    try:
+        return json.load(open(p))
+    except Exception:
+        return None
+
+def save(p, d):
+    json.dump(d, open(p, 'w'), indent=2)
+
+# 1. usage cache: accounts{} map
+p = '$USAGE_CACHE'
+d = load(p)
+if isinstance(d, dict) and isinstance(d.get('accounts'), dict):
+    if d['accounts'].pop(label, None) is not None:
+        save(p, d)
+
+# 2. switch history: switched_away{} map
+p = f'{home}/.claude/auto-switch-history.json'
+d = load(p)
+if isinstance(d, dict) and isinstance(d.get('switched_away'), dict):
+    if d['switched_away'].pop(label, None) is not None:
+        save(p, d)
+
+# 3. autostart state: drop any entries keyed by / referencing the label
+p = f'{home}/.claude/session-autostart-state.json'
+d = load(p)
+if isinstance(d, dict):
+    changed = False
+    for k, v in list(d.items()):
+        if isinstance(v, dict):
+            for sub in list(v.keys()):
+                if sub == label or (isinstance(v.get(sub), dict) and v[sub].get('label') == label):
+                    v.pop(sub, None); changed = True
+    if changed:
+        save(p, d)
 " 2>/dev/null
+    # 4. refresh-audit log: drop lines mentioning the label (plain-text log)
+    AUDIT_LOG="$HOME/.claude/auto-switch-refresh-audit.log"
+    if [ -f "$AUDIT_LOG" ]; then
+      grep -v -- "$LABEL" "$AUDIT_LOG" > "$AUDIT_LOG.tmp" 2>/dev/null && mv "$AUDIT_LOG.tmp" "$AUDIT_LOG"
+    fi
     if [ "$3" = "--purge" ]; then
       rm -f "$HOME/.claude-keychain-$LABEL.json" "$HOME/.claude.json.$LABEL" "$HOME/.claude-meta-$LABEL.json"
       log "REMOVE: purged credential backup files for '$LABEL'"
