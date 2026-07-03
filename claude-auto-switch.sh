@@ -2698,6 +2698,61 @@ if isinstance(d, dict):
     trigger_limit_for_label "$2"
     exit $?
     ;;
+  sync-account)
+    # Transfer a fully-configured account to the remote machine: push its
+    # credential bundle AND add its label to the remote config's accounts list
+    # (with token_based flag if --token-based is passed). Unlike repair-remote,
+    # this does NOT surrender the local refresh chain — it's an additive copy so
+    # the same account works on both machines. Idempotent: re-running just
+    # refreshes the files and leaves the config entry alone if already present.
+    SYNC_LABEL="$2"
+    SYNC_TOKEN_BASED="false"
+    [ "$3" = "--token-based" ] && SYNC_TOKEN_BASED="true"
+    if [ -z "$SYNC_LABEL" ]; then
+      echo "Usage: $0 sync-account <label> [--token-based]"
+      exit 1
+    fi
+    if [ -z "$REMOTE_HOST" ]; then
+      echo "sync-account: no remote_host configured"
+      exit 1
+    fi
+    if ! credentials_ready "$SYNC_LABEL"; then
+      echo "sync-account: no local credential backup for $SYNC_LABEL (run: $0 save $SYNC_LABEL first)"
+      exit 1
+    fi
+    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_HOST" true 2>/dev/null; then
+      echo "sync-account: remote $REMOTE_HOST unreachable"
+      exit 1
+    fi
+    # Push credential bundle
+    if ! scp -o ConnectTimeout=5 "$HOME/.claude-keychain-$SYNC_LABEL.json" "$REMOTE_HOST":~/.claude-keychain-"$SYNC_LABEL".json 2>/dev/null || \
+       ! scp -o ConnectTimeout=5 "$HOME/.claude.json.$SYNC_LABEL" "$REMOTE_HOST":~/.claude.json."$SYNC_LABEL" 2>/dev/null; then
+      log "SYNC: sync-account transfer failed for $SYNC_LABEL"
+      echo "sync-account: credential transfer to $REMOTE_HOST failed"
+      exit 1
+    fi
+    [ ! -f "$HOME/.claude-meta-$SYNC_LABEL.json" ] || scp -o ConnectTimeout=5 "$HOME/.claude-meta-$SYNC_LABEL.json" "$REMOTE_HOST":~/.claude-meta-"$SYNC_LABEL".json 2>/dev/null
+    # Add label to remote config accounts list (append at end, idempotent)
+    ssh -o ConnectTimeout=5 "$REMOTE_HOST" "python3 -c \"
+import json, os
+p = os.path.expanduser('~/.claude/auto-switch-config.json')
+c = json.load(open(p))
+accts = c.setdefault('accounts', [])
+labels = [a.get('label','') for a in accts]
+if '$SYNC_LABEL' not in labels:
+    entry = {'label': '$SYNC_LABEL'}
+    if '$SYNC_TOKEN_BASED' == 'true':
+        entry['token_based'] = True
+    accts.append(entry)
+    json.dump(c, open(p, 'w'), indent=2)
+    print('added to remote config')
+else:
+    print('already in remote config')
+\"" 2>/dev/null
+    log "SYNC: sync-account pushed $SYNC_LABEL to $REMOTE_HOST (token_based=$SYNC_TOKEN_BASED)"
+    echo "Synced $SYNC_LABEL to $REMOTE_HOST."
+    exit 0
+    ;;
   repair-remote)
     # Repair a dead account on the remote machine by donating this machine's
     # working credential bundle. The refresh-token chain moves to the remote;

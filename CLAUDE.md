@@ -23,6 +23,7 @@ A single-file bash daemon that rotates between multiple Claude.ai accounts when 
 ./claude-auto-switch.sh save <label>
 ./claude-auto-switch.sh restore <label>
 ./claude-auto-switch.sh remove-account <label> [--purge]
+./claude-auto-switch.sh sync-account <label> [--token-based]
 
 # Install the timer
 ./install.sh
@@ -50,7 +51,9 @@ All logic lives in one file. The bottom of the script is the entry point — a `
 8. Token-account escape — if the active account is `token_based`, leave it for the highest-priority Pro account below threshold (reason `leave-token-account`); if none, stay parked. Runs before the threshold check.
 9. Threshold check — switch to next available account if `UTIL >= THRESHOLD`
 
-**Account priority & types:** the `accounts` array in config is the priority order (index 0 = highest). An account marked `"token_based": true` never reports a meaningful usage % — it's a last-resort account, pinned last in priority. The daemon parks on it only when no Pro account is available and switches away the moment one is (`is_token_account` helper + escape block in the timer loop). Remove accounts with `remove-account <label> [--purge]`; `--purge` also deletes the credential backup files and usage-cache entry. Removing the active account is refused.
+**Account priority & types:** the `accounts` array in config is the priority order (index 0 = highest). An account marked `"token_based": true` never reports a meaningful usage % (API-credit accounts — "empty is empty") — it's a last-resort account, pinned last in priority. The daemon parks on it only when no Pro account is available and switches away the moment one is (`is_token_account` helper + escape block in the timer loop). Remove accounts with `remove-account <label> [--purge]`; `--purge` also deletes the credential backup files and cleans every state file that tracks the label (usage cache, switch history, refresh-audit log, autostart state). Removing the active account is refused.
+
+**Adding accounts + cross-machine transfer:** add on the primary machine via the SwiftBar "➕ Add account" → `/login` → "💾 Save credentials" flow, then add the label to the config `accounts` array (append at the end for token accounts, with `"token_based": true`). To propagate a fully-configured account to the remote machine, run `sync-account <label> [--token-based]` — it pushes the credential bundle **and** appends the label (with the flag) to the remote config's `accounts` list (idempotent; additive, unlike `repair-remote` which surrenders the local refresh chain).
 
 ### Config and State Files
 
