@@ -22,6 +22,7 @@ A single-file bash daemon that rotates between multiple Claude.ai accounts when 
 ./claude-auto-switch.sh start-all-sessions
 ./claude-auto-switch.sh save <label>
 ./claude-auto-switch.sh restore <label>
+./claude-auto-switch.sh remove-account <label> [--purge]
 
 # Install the timer
 ./install.sh
@@ -46,7 +47,10 @@ All logic lives in one file. The bottom of the script is the entry point — a `
 5. `maybe_run_scheduled_session` / `maybe_run_auto_continue_sessions` — fire any pending auto-starts or auto-continues
 6. `fetch_usage` — poll the Claude usage API for the active account
 7. Priority-return check — switch back to an earlier (preferred) account if it has recovered below `preferred_return_threshold`
-8. Threshold check — switch to next available account if `UTIL >= THRESHOLD`
+8. Token-account escape — if the active account is `token_based`, leave it for the highest-priority Pro account below threshold (reason `leave-token-account`); if none, stay parked. Runs before the threshold check.
+9. Threshold check — switch to next available account if `UTIL >= THRESHOLD`
+
+**Account priority & types:** the `accounts` array in config is the priority order (index 0 = highest). An account marked `"token_based": true` never reports a meaningful usage % — it's a last-resort account, pinned last in priority. The daemon parks on it only when no Pro account is available and switches away the moment one is (`is_token_account` helper + escape block in the timer loop). Remove accounts with `remove-account <label> [--purge]`; `--purge` also deletes the credential backup files and usage-cache entry. Removing the active account is refused.
 
 ### Config and State Files
 

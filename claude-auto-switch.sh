@@ -138,6 +138,21 @@ for account in d.get('accounts', []):
 " 2>/dev/null
 }
 
+# True (exit 0) if the given label is a token-based account. Token accounts never
+# hit a usage % threshold, so they are treated as last-resort: the daemon parks on
+# one only when no Pro account is available, and switches away the moment one is.
+is_token_account() {
+  local LABEL="$1"
+  python3 -c "
+import json, sys
+d = json.load(open('$CONFIG'))
+for a in d.get('accounts', []):
+    if a.get('label', '') == '$LABEL':
+        sys.exit(0 if a.get('token_based') else 1)
+sys.exit(1)
+" 2>/dev/null
+}
+
 update_usage_cache() {
   local LABEL="$1"
   local UTIL="$2"
@@ -2588,6 +2603,54 @@ case "$1" in
     fi
     exit 1
     ;;
+  remove-account)
+    LABEL="$2"
+    if [ -z "$LABEL" ]; then
+      echo "Usage: $0 remove-account <label> [--purge]"
+      echo "  Removes <label> from the priority list. Add --purge to also delete its"
+      echo "  credential backup files (~/.claude-keychain-<label>.json, ~/.claude.json.<label>,"
+      echo "  ~/.claude-meta-<label>.json) and its usage-cache entry."
+      exit 1
+    fi
+    CUR_ACTIVE=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('active_account',''))" 2>/dev/null)
+    if [ "$LABEL" = "$CUR_ACTIVE" ]; then
+      echo "Refusing: '$LABEL' is the active account. Switch away first (restore <other>), then remove."
+      exit 1
+    fi
+    # Remove from config accounts list
+    REMOVED=$(python3 -c "
+import json
+p='$CONFIG'
+c=json.load(open(p))
+before=len(c.get('accounts',[]))
+c['accounts']=[a for a in c.get('accounts',[]) if a.get('label','')!='$LABEL']
+json.dump(c, open(p,'w'), indent=2)
+print(before-len(c['accounts']))
+" 2>/dev/null)
+    if [ "${REMOVED:-0}" -eq 0 ]; then
+      echo "Not found in config: '$LABEL' (nothing removed)"
+    else
+      log "REMOVE: '$LABEL' removed from priority list"
+    fi
+    # Remove from usage cache
+    python3 -c "
+import json, os
+p='$USAGE_CACHE'
+if os.path.exists(p):
+    c=json.load(open(p))
+    if isinstance(c.get('accounts'),dict):
+        c['accounts'].pop('$LABEL', None)
+        json.dump(c, open(p,'w'), indent=2)
+" 2>/dev/null
+    if [ "$3" = "--purge" ]; then
+      rm -f "$HOME/.claude-keychain-$LABEL.json" "$HOME/.claude.json.$LABEL" "$HOME/.claude-meta-$LABEL.json"
+      log "REMOVE: purged credential backup files for '$LABEL'"
+      echo "Purged backup files for '$LABEL'."
+    else
+      echo "Config updated. Backup files kept (pass --purge to delete them)."
+    fi
+    exit 0
+    ;;
   trigger-limit)
     if [ -z "$2" ]; then
       echo "Usage: $0 trigger-limit <label>"
@@ -2965,6 +3028,25 @@ if [ "$CURRENT_POLL_STATUS" != "ok" ]; then
 
   IFS='|' read -r TARGET TARGET_UTIL TARGET_RESETS_AT <<< "$TARGET_INFO"
   perform_switch "$CUR_LABEL" "$UTIL" "$RESETS_AT" "$TARGET" "$TARGET_UTIL" "$NOW" "api-error"
+  exit 0
+fi
+
+# ── Token-account escape: park on a token account only as last resort ──
+# A token-based account (e.g. an API-key / console account) never reports a meaningful usage % and is
+# pinned to last place in priority. If we're currently on one, leave it the moment
+# any Pro account is available below threshold — regardless of the token account's
+# own util. find_ordered_switch_target walks accounts in priority order, so it
+# returns the highest-priority Pro account (token accounts sit last).
+if is_token_account "$CUR_LABEL"; then
+  TARGET_INFO=$(find_ordered_switch_target "$CUR_LABEL" "$THRESHOLD")
+  if [ -n "$TARGET_INFO" ]; then
+    IFS='|' read -r TARGET TARGET_UTIL TARGET_RESETS_AT <<< "$TARGET_INFO"
+    if ! is_token_account "$TARGET"; then
+      perform_switch "$CUR_LABEL" "$UTIL" "$RESETS_AT" "$TARGET" "$TARGET_UTIL" "$NOW" "leave-token-account"
+      exit 0
+    fi
+  fi
+  # No Pro account available — stay parked on the token account, don't threshold-switch.
   exit 0
 fi
 
